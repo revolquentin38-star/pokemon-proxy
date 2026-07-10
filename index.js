@@ -31,28 +31,21 @@ async function getCardIdFromAI(imageUrl, title) {
 app.post('/api/analyser', async (req, res) => {
     try {
         const { imageUrl, title } = req.body;
-        const cardInfo = await getCardIdFromAI(imageUrl, title);
-        if (!cardInfo) return res.status(400).json({ error: "IA échec" });
-
-        const query = `site:cardmarket.com Pokemon ${cardInfo.name} ${cardInfo.number}`;
-        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-        // Ajout du timeout dans l'URL ScraperAPI
-        const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(searchUrl)}&render=true&timeout=30000`;
+        // ... logique IA ...
         
-        const response = await axios.get(scraperUrl);
-        const $ = cheerio.load(response.data);
-        const link = $('a[href*="cardmarket.com"]').first().attr('href');
+        // --- LOGIQUE SCRAPING SÉCURISÉE ---
+        const price = await getPriceFromCardmarket(cardInfo.name, cardInfo.number);
         
-        if (!link) return res.status(404).json({ error: "Non trouvé sur Google" });
-
-        const pResponse = await axios.get(`https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(link)}&render=true&timeout=30000`);
-        const $p = cheerio.load(pResponse.data);
-        const price = $p('.price-container .price').first().text().trim();
-
-        res.json({ success: true, price: price || "Prix indisponible" });
+        if (price) {
+            // Réponse de succès
+            res.json({ success: true, price: price });
+        } else {
+            // Réponse propre si on ne trouve rien (pas d'erreur serveur)
+            res.json({ success: false, error: "Prix introuvable" });
+        }
     } catch (error) {
-        console.error("Erreur Scraping:", error.message);
-        res.status(502).json({ error: "Erreur de communication API" });
+        // En cas de bug API, on renvoie un JSON au lieu de faire planter le serveur
+        res.json({ success: false, error: "Erreur technique lors de l'analyse" });
     }
 });
 
