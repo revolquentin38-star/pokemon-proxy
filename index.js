@@ -7,11 +7,10 @@ const cheerio = require('cheerio');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Autorise ton extension Chrome (CORS)
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// 1. Analyse IA avec modèle stable
+// Analyse IA
 async function getCardIdFromAI(imageUrl, title) {
     try {
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
@@ -19,54 +18,40 @@ async function getCardIdFromAI(imageUrl, title) {
             "messages": [{
                 "role": "user",
                 "content": [
-                    { "type": "text", "text": `Extrais le nom et le numéro de cette carte. JSON strict : {"name": "Nom", "number": "123"}. Titre : ${title}` },
+                    { "type": "text", "text": `Extrais le nom et le numéro. JSON strict : {"name": "Nom", "number": "123"}. Titre : ${title}` },
                     { "type": "image_url", "image_url": { "url": imageUrl } }
                 ]
             }]
         }, { headers: { "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`, "HTTP-Referer": "https://render.com" } });
-        
         return JSON.parse(response.data.choices[0].message.content.replace(/```json|```/g, "").trim());
-    } catch (e) { 
-        console.error("Erreur IA:", e.message);
-        return null; 
-    }
+    } catch (e) { return null; }
 }
 
-// 2. Route d'analyse sécurisée
+// Route principale
 app.post('/api/analyser', async (req, res) => {
     try {
         const { imageUrl, title } = req.body;
-        
         const cardInfo = await getCardIdFromAI(imageUrl, title);
+        
         if (!cardInfo) return res.json({ success: false, error: "Analyse IA échouée" });
 
-        // Recherche Google -> Cardmarket
         const query = `site:cardmarket.com Pokemon ${cardInfo.name} ${cardInfo.number}`;
-        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-        const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(searchUrl)}&render=true&timeout=40000`;
+        const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(`https://www.google.com/search?q=${query}`)}&render=true`;
         
         const response = await axios.get(scraperUrl);
         const $ = cheerio.load(response.data);
         const link = $('a[href*="cardmarket.com"]').first().attr('href');
         
-        if (!link) return res.json({ success: false, error: "Carte non trouvée" });
+        if (!link) return res.json({ success: false, error: "Non trouvé sur Cardmarket" });
 
-        // Scraping prix
-        const pResponse = await axios.get(`https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(link)}&render=true&timeout=40000`);
+        const pResponse = await axios.get(`https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(link)}&render=true`, { timeout: 30000 });
         const $p = cheerio.load(pResponse.data);
         const price = $p('.price-container .price').first().text().trim();
 
-        if (price) {
-            res.json({ success: true, price: price });
-        } else {
-            res.json({ success: false, error: "Prix non affiché sur Cardmarket" });
-        }
-        
+        res.json({ success: true, price: price || "Prix indisponible" });
     } catch (error) {
-        console.error("Erreur Serveur:", error.message);
-        // On renvoie success: false au lieu d'une erreur 500 pour ne pas faire crasher l'extension
         res.json({ success: false, error: "Erreur serveur interne" });
     }
 });
 
-app.listen(PORT, () => console.log(`Serveur actif sur port ${PORT}`));
+app.listen(PORT, () => console.log(`Serveur actif`));
