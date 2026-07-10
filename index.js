@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// 1. Analyse IA (Gemini Flash)
+// 1. Analyse IA
 async function getCardIdFromAI(imageUrl, title) {
     try {
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
@@ -27,35 +27,33 @@ async function getCardIdFromAI(imageUrl, title) {
     } catch (e) { return null; }
 }
 
-// 2. Scraping optimisé (Recherche Google + Parsing direct)
+// 2. Scraping avec gestion d'erreurs améliorée
 app.post('/api/analyser', async (req, res) => {
-    req.socket.setTimeout(60000); // Protection contre timeout 499
     try {
         const { imageUrl, title } = req.body;
         const cardInfo = await getCardIdFromAI(imageUrl, title);
         if (!cardInfo) return res.status(400).json({ error: "IA échec" });
 
-        // Recherche Google vers Cardmarket
         const query = `site:cardmarket.com Pokemon ${cardInfo.name} ${cardInfo.number}`;
         const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-        const scraperUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(searchUrl)}&render=true`;
+        // Ajout du timeout dans l'URL ScraperAPI
+        const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(searchUrl)}&render=true&timeout=30000`;
         
         const response = await axios.get(scraperUrl);
         const $ = cheerio.load(response.data);
-        
-        // Récupérer le lien Cardmarket
         const link = $('a[href*="cardmarket.com"]').first().attr('href');
+        
         if (!link) return res.status(404).json({ error: "Non trouvé sur Google" });
 
-        // Scraper le prix depuis le lien
-        const pResponse = await axios.get(`http://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(link)}&render=true`);
+        const pResponse = await axios.get(`https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(link)}&render=true&timeout=30000`);
         const $p = cheerio.load(pResponse.data);
         const price = $p('.price-container .price').first().text().trim();
 
         res.json({ success: true, price: price || "Prix indisponible" });
     } catch (error) {
-        res.status(500).json({ error: "Erreur lors du scraping" });
+        console.error("Erreur Scraping:", error.message);
+        res.status(502).json({ error: "Erreur de communication API" });
     }
 });
 
-app.listen(PORT, () => console.log(`Serveur prêt sur port ${PORT}`));
+app.listen(PORT, () => console.log(`Serveur actif`));
