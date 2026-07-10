@@ -30,7 +30,7 @@ async function getCardIdFromAI(imageUrl, title) {
     console.log("Analyse IA (Gemini 1.5 Pro) en cours...");
     try {
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-            "model": "google/gemini-pro-1.5", 
+            "model": "google/gemini-pro-latest", 
             "messages": [{
                 "role": "user",
                 "content": [
