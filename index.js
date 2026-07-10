@@ -1,5 +1,5 @@
 const express = require('express');
-const cors = require('cors');
+const cors = require('cors'); // Obligatoire
 const { OpenAI } = require('openai');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -9,15 +9,16 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// CONFIGURATION CORS : C'est ce qui débloque ton extension
+app.use(cors()); 
+
 app.use(express.json());
 
-// 1. Connexion MongoDB
+// Connexion MongoDB
 mongoose.connect(process.env.MONGODB_URI)
     .then(() => console.log("Connecté à MongoDB Atlas"))
     .catch(err => console.error("Erreur connexion MongoDB :", err));
 
-// Définition du modèle de données
 const CardPriceSchema = new mongoose.Schema({
     cardId: { type: String, required: true, unique: true },
     price: String,
@@ -34,12 +35,11 @@ app.post('/api/analyser', async (req, res) => {
     const { imageUrl, title } = req.body;
 
     try {
-        // --- ÉTAPE A : Identification (Ton code IA existant) ---
-        // (Supposons que tu récupères l'ID ici)
+        // Identification IA (Ton logic existant)
         const foundCard = await getCardIdFromAI(imageUrl, title); 
         const cardId = `${foundCard.set}-${foundCard.number}`;
 
-        // --- ÉTAPE B : CACHE-FIRST (On cherche en DB) ---
+        // CACHE-FIRST : Vérification DB
         const cachedCard = await CardPrice.findOne({ cardId: cardId });
         const oneDayInMs = 24 * 60 * 60 * 1000;
         
@@ -48,17 +48,15 @@ app.post('/api/analyser', async (req, res) => {
             return res.json({ success: true, data: { prix: cachedCard.price, source: "db_cache" } });
         }
 
-        // --- ÉTAPE C : Scraping (Seulement si nécessaire) ---
-        console.log("Cache absent ou périmé, scraping nécessaire pour :", cardId);
-        const cmUrl = foundCard.url; // URL Cardmarket
-        
-        const { data: html } = await axios.get(cmUrl, { 
+        // Scraping
+        console.log("Cache absent, scraping pour :", cardId);
+        const { data: html } = await axios.get(foundCard.url, { 
             headers: { 'User-Agent': 'Mozilla/5.0' } 
         });
         const $ = cheerio.load(html);
         const scrapedPrice = $('.table-body .row .col-offer').first().text().trim();
 
-        // --- ÉTAPE D : Mise à jour de la base ---
+        // Sauvegarde DB
         await CardPrice.findOneAndUpdate(
             { cardId: cardId },
             { price: scrapedPrice, lastUpdated: new Date() },
@@ -68,13 +66,8 @@ app.post('/api/analyser', async (req, res) => {
         res.json({ success: true, data: { prix: scrapedPrice, source: "scraping" } });
 
     } catch (error) {
-        console.error("Erreur globale :", error);
-        
-        // Sécurité : Si le scraping échoue, on renvoie quand même l'ancien prix du cache s'il existe
-        if (cachedCard) {
-            return res.json({ success: true, data: { prix: cachedCard.price, source: "cache_expire_fallback" } });
-        }
-        res.status(500).json({ error: "Erreur serveur / Scraping impossible" });
+        console.error("Erreur serveur :", error);
+        res.status(500).json({ error: "Erreur lors de l'analyse" });
     }
 });
 
