@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { OpenAI } = require('openai');
-const axios = require('axios'); 
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,15 +18,19 @@ app.post('/api/analyser', async (req, res) => {
     const { imageUrl, title } = req.body;
 
     try {
-        // 1. Identification via l'IA Vision
+        // 1. Analyse visuelle par l'IA
         const completion = await openai.chat.completions.create({
             model: "openai/gpt-4o",
-            max_tokens: 150,
+            max_tokens: 300,
             messages: [
+                {
+                    role: "system",
+                    content: "Tu es un expert Pokémon. Analyse l'image et le titre fourni. Retourne TOUJOURS un objet JSON pur sans texte autour. Format: {'nom': 'nom exact', 'numero': 'juste le numéro', 'serie': 'nom de la série', 'langue': 'fr/en/jp'}"
+                },
                 {
                     role: "user",
                     content: [
-                        { type: "text", text: `Identifie cette carte Pokémon. Titre Vinted : ${title}. Retourne UNIQUEMENT un objet JSON avec ce format exact : {"nom": "nom exact du pokemon en anglais (ex: Mr. Mime)", "numero": "numéro de la carte SEUL, sans le total et sans slash (ex: 179)"}` },
+                        { type: "text", text: `Analyse cette carte. Titre Vinted: ${title}.` },
                         { type: "image_url", image_url: { url: imageUrl } }
                     ]
                 }
@@ -34,49 +38,53 @@ app.post('/api/analyser', async (req, res) => {
             response_format: { type: "json_object" }
         });
 
-        const dataIA = JSON.parse(completion.choices[0].message.content);
-        console.log("Données de l'IA reçues :", dataIA);
+        // 2. Sécurisation : Tentative de parsing
+        const rawContent = completion.choices[0].message.content;
+        let dataIA;
+        
+        try {
+            dataIA = JSON.parse(rawContent);
+        } catch (e) {
+            throw new Error("L'IA n'a pas renvoyé un format JSON valide.");
+        }
 
-        // 2. Recherche du prix sur l'API Pokémon TCG
-        // Utilisation des "params" d'Axios pour encoder proprement les espaces et caractères spéciaux
+        // Vérification de sécurité : est-ce qu'on a bien un nom ?
+        if (!dataIA || !dataIA.nom) {
+            throw new Error("L'IA n'a pas réussi à identifier la carte.");
+        }
+
+        console.log("Données IA identifiées :", dataIA);
+
+        // 3. Recherche API Pokémon (Requête flexible)
+        // On cherche par nom + numéro pour être précis
+        const query = `name:"${dataIA.nom}" number:${dataIA.numero}`;
         const responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
-            params: {
-                q: `name:"${dataIA.nom}" number:${dataIA.numero}`
-            }
+            params: { q: query }
         });
 
         if (responseAPI.data.data && responseAPI.data.data.length > 0) {
             const card = responseAPI.data.data[0];
-            
-            const prix = card.cardmarket && card.cardmarket.prices ? card.cardmarket.prices.averageSellPrice : "N/A";
+            const prix = card.cardmarket?.prices?.averageSellPrice || "N/A";
 
             res.json({
                 success: true,
                 data: {
                     nom: card.name,
                     numero: dataIA.numero,
+                    serie: dataIA.serie, // La série identifiée par l'IA
                     prix: prix
                 }
             });
         } else {
-            res.status(404).json({
-                success: false,
-                error: `Carte ${dataIA.nom} (${dataIA.numero}) introuvable sur la base de données.`
-            });
+            res.status(404).json({ success: false, error: "Carte trouvée par l'IA mais pas dans la base de données officielle." });
         }
 
     } catch (error) {
-        // Ajout d'un log plus précis si c'est Axios qui plante
-        const errorMessage = error.response?.data?.error?.message || error.message || "Erreur interne.";
-        console.error("Erreur serveur :", errorMessage);
-        
-        res.status(500).json({ 
-            success: false, 
-            error: errorMessage
-        });
+        console.error("Erreur serveur :", error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Le serveur écoute sur le port ${PORT}`);
+    console.log(`Serveur prêt sur le port ${PORT}`);
 });
