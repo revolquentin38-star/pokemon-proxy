@@ -10,7 +10,11 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Remplace ton initialisation actuelle par celle-ci :
+const openai = new OpenAI({
+    apiKey: process.env.OPENROUTER_API_KEY, // Assure-toi que la variable s'appelle bien comme ça
+    baseURL: "https://openrouter.ai/api/v1", // C'est ça qui force la connexion à OpenRouter
+});
 
 app.post('/api/analyser', async (req, res) => {
     const { imageUrl, title } = req.body;
