@@ -26,35 +26,43 @@ const CardPriceSchema = new mongoose.Schema({
 });
 const CardPrice = mongoose.model('CardPrice', CardPriceSchema);
 
-// Fonction IA optimisée pour Gemini 1.5 Pro (via OpenRouter)
 async function getCardIdFromAI(imageUrl, title) {
-    console.log("Analyse IA (Gemini 1.5 Pro) en cours pour :", title);
+    console.log("Analyse IA (Gemini 1.5 Pro) en cours...");
     try {
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-            "model": "google/gemini-pro-1.5",
+            "model": "google/gemini-pro-1.5", 
             "messages": [{
                 "role": "user",
                 "content": [
                     { 
                         "type": "text", 
-                        "text": `Expert Pokémon. Analyse cette image et le titre "${title}". 
+                        "text": `Expert Pokémon. Analyse cette carte : "${title}". 
                         Extrais le nom de l'extension et le numéro de la carte.
-                        Réponds UNIQUEMENT par un JSON pur sans texte : {"set": "nom-extension-anglais", "number": "123"}.` 
+                        Réponds UNIQUEMENT par un JSON pur : {"set": "nom-extension", "number": "123"}.` 
                     },
                     { "type": "image_url", "image_url": { "url": imageUrl } }
                 ]
             }]
-        }, { headers: { "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}` } });
+        }, { 
+            headers: { 
+                "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                "HTTP-Referer": "https://render.com", // Requis par OpenRouter
+                "X-Title": "PokemonScanner"
+            } 
+        });
 
         const content = response.data.choices[0].message.content.replace(/```json|```/g, "").trim();
         const result = JSON.parse(content);
         
-        if (!result.set) return null;
+        if (!result.set || !result.number) return null;
 
-        const formattedSet = result.set.replace(/\s+/g, '-');
+        const formattedSet = result.set.toLowerCase().replace(/\s+/g, '-');
         const url = `https://www.cardmarket.com/fr/Pokemon/Products/Singles/${formattedSet}/${result.set}-${result.number}`;
         return { cardId: `${formattedSet}-${result.number}`, url };
-    } catch (e) { console.error("Erreur IA :", e); return null; }
+    } catch (e) { 
+        console.error("Erreur détaillée IA :", e.response ? e.response.data : e.message); 
+        return null; 
+    }
 }
 
 app.post('/api/analyser', async (req, res) => {
@@ -62,40 +70,35 @@ app.post('/api/analyser', async (req, res) => {
         const { imageUrl, title } = req.body;
         const cardInfo = await getCardIdFromAI(imageUrl, title);
         
-        if (!cardInfo) return res.json({ success: false, error: "IA n'a pas pu identifier la carte" });
+        if (!cardInfo) return res.json({ success: false, error: "Identification échouée" });
 
         const cachedCard = await CardPrice.findOne({ cardId: cardInfo.cardId });
         if (cachedCard) return res.json({ success: true, data: { price: cachedCard.price, source: "cache" } });
 
         const browser = await puppeteer.launch({
             headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
         });
 
         const page = await browser.newPage();
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font'].includes(req.resourceType())) req.abort();
-            else req.continue();
-        });
-
         await page.goto(cardInfo.url, { waitUntil: 'domcontentloaded' });
         
         const price = await page.evaluate(() => {
             const el = document.querySelector('.price-container .price');
-            return el ? el.innerText.trim() : "Prix introuvable";
+            return el ? el.innerText.trim() : null;
         });
 
         await browser.close();
 
-        if (price !== "Prix introuvable") {
+        if (price) {
             await CardPrice.findOneAndUpdate({ cardId: cardInfo.cardId }, { price, lastUpdated: new Date() }, { upsert: true });
+            res.json({ success: true, data: { price, source: "scraping" } });
+        } else {
+            res.json({ success: false, error: "Prix non trouvé" });
         }
-
-        res.json({ success: true, data: { price, source: "scraping" } });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: "Erreur lors de l'analyse" });
+        res.status(500).json({ error: "Erreur serveur" });
     }
 });
 
