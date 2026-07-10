@@ -27,18 +27,18 @@ const CardPriceSchema = new mongoose.Schema({
 const CardPrice = mongoose.model('CardPrice', CardPriceSchema);
 
 async function getCardIdFromAI(imageUrl, title) {
-    console.log("Analyse IA (Gemini 1.5 Pro) en cours...");
+    console.log("Analyse IA (Gemini) en cours pour :", title);
     try {
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-            "model": "~google/gemini-pro-latest", 
+            "model": "~google/gemini-pro-1.5", 
             "messages": [{
                 "role": "user",
                 "content": [
                     { 
                         "type": "text", 
                         "text": `Expert Pokémon. Analyse cette carte : "${title}". 
-                        Extrais le nom de l'extension et le numéro de la carte.
-                        Réponds UNIQUEMENT par un JSON pur : {"set": "nom-extension", "number": "123"}.` 
+                        Extrais le nom de l'extension en ANGLAIS (ex: "Twilight Masquerade", "Paldea Evolved", "151") et le numéro de la carte (ex: "129").
+                        Réponds UNIQUEMENT par un JSON pur sans markdown : {"set": "nom-extension", "number": "123"}.` 
                     },
                     { "type": "image_url", "image_url": { "url": imageUrl } }
                 ]
@@ -46,7 +46,7 @@ async function getCardIdFromAI(imageUrl, title) {
         }, { 
             headers: { 
                 "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-                "HTTP-Referer": "https://render.com", // Requis par OpenRouter
+                "HTTP-Referer": "https://render.com",
                 "X-Title": "PokemonScanner"
             } 
         });
@@ -56,49 +56,88 @@ async function getCardIdFromAI(imageUrl, title) {
         
         if (!result.set || !result.number) return null;
 
-        const formattedSet = result.set.toLowerCase().replace(/\s+/g, '-');
-        const url = `https://www.cardmarket.com/fr/Pokemon/Products/Singles/${formattedSet}/${result.set}-${result.number}`;
+        // Formatage pour Cardmarket
+        const formattedSet = result.set.replace(/\s+/g, '-');
+        const url = `https://www.cardmarket.com/fr/Pokemon/Products/Singles/${formattedSet}/${formattedSet}-${result.number}`;
+        
+        console.log("--> URL Cardmarket générée par l'IA :", url);
         return { cardId: `${formattedSet}-${result.number}`, url };
     } catch (e) { 
-        console.error("Erreur détaillée IA :", e.response ? e.response.data : e.message); 
+        console.error("Erreur IA :", e.message); 
         return null; 
     }
 }
 
 app.post('/api/analyser', async (req, res) => {
+    let browser;
     try {
         const { imageUrl, title } = req.body;
         const cardInfo = await getCardIdFromAI(imageUrl, title);
         
-        if (!cardInfo) return res.json({ success: false, error: "Identification échouée" });
+        if (!cardInfo) return res.json({ success: false, error: "L'IA n'a pas pu identifier la carte" });
 
+        // Vérification du Cache MongoDB
         const cachedCard = await CardPrice.findOne({ cardId: cardInfo.cardId });
-        if (cachedCard) return res.json({ success: true, data: { price: cachedCard.price, source: "cache" } });
+        if (cachedCard) {
+            console.log("Prix trouvé dans le cache :", cachedCard.price);
+            return res.json({ success: true, data: { price: cachedCard.price, source: "cache" } });
+        }
 
-        const browser = await puppeteer.launch({
+        console.log("Lancement du scraping sur :", cardInfo.url);
+        browser = await puppeteer.launch({
             headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         });
 
         const page = await browser.newPage();
-        await page.goto(cardInfo.url, { waitUntil: 'domcontentloaded' });
         
+        // Bloquer les images/css pour aller beaucoup plus vite
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'font'].includes(req.resourceType())) req.abort();
+            else req.continue();
+        });
+
+        // Aller sur la page de la carte
+        await page.goto(cardInfo.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        
+        // Attendre que la boîte de prix soit visible (on essaie plusieurs sélecteurs connus de Cardmarket)
         const price = await page.evaluate(() => {
-            const el = document.querySelector('.price-container .price');
-            return el ? el.innerText.trim() : null;
+            // Essaye le sélecteur classique, ou la liste d'informations à droite
+            const el1 = document.querySelector('.price-container .price');
+            if (el1) return el1.innerText.trim();
+            
+            const el2 = document.querySelector('dt:contains("À partir de") + dd');
+            if (el2) return el2.innerText.trim();
+
+            // Recherche textuelle de secours dans les statistiques du produit
+            const cells = Array.from(document.querySelectorAll('.dt-horizontal dt'));
+            for (let cell of cells) {
+                if (cell.textContent.includes('À partir de') || cell.textContent.includes('From')) {
+                    return cell.nextElementSibling ? cell.nextElementSibling.textContent.trim() : null;
+                }
+            }
+            return null;
         });
 
         await browser.close();
+        console.log("Prix scrapé sur Cardmarket :", price);
 
-        if (price) {
-            await CardPrice.findOneAndUpdate({ cardId: cardInfo.cardId }, { price, lastUpdated: new Date() }, { upsert: true });
-            res.json({ success: true, data: { price, source: "scraping" } });
+        if (price && price !== "Prix introuvable") {
+            await CardPrice.findOneAndUpdate(
+                { cardId: cardInfo.cardId }, 
+                { price, lastUpdated: new Date() }, 
+                { upsert: true }
+            );
+            return res.json({ success: true, data: { price, source: "scraping" } });
         } else {
-            res.json({ success: false, error: "Prix non trouvé" });
+            return res.json({ success: false, error: "Prix introuvable sur Cardmarket. Vérifie l'URL." });
         }
+
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: "Erreur serveur" });
+        if (browser) await browser.close();
+        console.error("Erreur scraping :", error);
+        res.status(500).json({ error: "Erreur lors du scraping du prix" });
     }
 });
 
