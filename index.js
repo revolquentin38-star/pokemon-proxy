@@ -21,7 +21,8 @@ app.post('/api/analyser', async (req, res) => {
     try {
         // 1. Identification de la carte via l'IA Vision (OpenRouter)
         const completion = await openai.chat.completions.create({
-            model: "openai/gpt-4o", // <- Le modèle exact attendu par OpenRouter
+            model: "openai/gpt-4o", // Le modèle exact attendu par OpenRouter
+            max_tokens: 150,        // <-- AJOUT : Limite la longueur pour éviter l'erreur 402 de crédits
             messages: [
                 {
                     role: "user",
