@@ -18,19 +18,19 @@ app.post('/api/analyser', async (req, res) => {
     const { imageUrl, title } = req.body;
 
     try {
-        // 1. Analyse visuelle par l'IA
+        // 1. Analyse par l'IA
         const completion = await openai.chat.completions.create({
             model: "openai/gpt-4o",
-            max_tokens: 300,
+            max_tokens: 150,
             messages: [
                 {
                     role: "system",
-                    content: "Tu es un expert Pokémon. Analyse l'image. Retourne UN JSON pur. Format: {'nom': 'nom exact', 'numero': 'numéro seul sans slash (ex: 179)', 'serie': 'nom série'}"
+                    content: "Tu es un expert. Retourne un JSON : {'nom': 'nom du pokémon', 'numero': 'juste le numéro sans le total'}"
                 },
                 {
                     role: "user",
                     content: [
-                        { type: "text", text: `Analyse cette carte. Titre Vinted: ${title}.` },
+                        { type: "text", text: `Analyse cette carte. Titre Vinted : ${title}.` },
                         { type: "image_url", image_url: { url: imageUrl } }
                     ]
                 }
@@ -39,31 +39,32 @@ app.post('/api/analyser', async (req, res) => {
         });
 
         const dataIA = JSON.parse(completion.choices[0].message.content);
-        console.log("Données IA extraites :", dataIA);
+        console.log("IA a trouvé :", dataIA);
 
-        // 2. Recherche plus souple : on cherche juste par nom d'abord
+        // 2. Recherche large par nom uniquement
+        // On ne met pas le numéro dans la requête pour éviter les 404
         const responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
-            params: { q: `name:"${dataIA.nom}"` } // Recherche large par nom
+            params: { q: `name:"${dataIA.nom}"` }
         });
 
-        // 3. Filtrage intelligent dans les résultats reçus
+        // 3. Filtrage intelligent
         const results = responseAPI.data.data;
-        const foundCard = results.find(c => c.number === dataIA.numero) || results[0];
-
-        if (foundCard) {
-            const prix = foundCard.cardmarket?.prices?.averageSellPrice || "N/A";
-            res.json({
-                success: true,
-                data: {
-                    nom: foundCard.name,
-                    numero: foundCard.number,
-                    serie: dataIA.serie,
-                    prix: prix
-                }
-            });
-        } else {
-            res.status(404).json({ success: false, error: "Carte non trouvée dans la base de données." });
+        if (!results || results.length === 0) {
+            return res.status(404).json({ success: false, error: "Carte non trouvée" });
         }
+
+        // On cherche le numéro dans les résultats reçus
+        const card = results.find(c => c.number === dataIA.numero) || results[0];
+        const prix = card.cardmarket?.prices?.averageSellPrice || "N/A";
+
+        res.json({
+            success: true,
+            data: {
+                nom: card.name,
+                numero: card.number,
+                prix: prix
+            }
+        });
 
     } catch (error) {
         console.error("Erreur serveur :", error.message);
@@ -72,5 +73,5 @@ app.post('/api/analyser', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur prêt sur le port ${PORT}`);
+    console.log(`Le serveur écoute sur le port ${PORT}`);
 });
