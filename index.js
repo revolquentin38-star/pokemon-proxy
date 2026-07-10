@@ -26,21 +26,20 @@ const CardPriceSchema = new mongoose.Schema({
 });
 const CardPrice = mongoose.model('CardPrice', CardPriceSchema);
 
-// Fonction IA optimisée
+// Fonction IA optimisée pour Gemini 1.5 Pro (via OpenRouter)
 async function getCardIdFromAI(imageUrl, title) {
-    console.log("Analyse IA en cours pour :", title);
+    console.log("Analyse IA (Gemini 1.5 Pro) en cours pour :", title);
     try {
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-            "model": "openai/gpt-4o",
+            "model": "google/gemini-pro-1.5",
             "messages": [{
                 "role": "user",
                 "content": [
                     { 
                         "type": "text", 
-                        "text": `Tu es un expert Pokémon. Analyse l'image et le titre "${title}". 
-                        Extrais le nom de l'extension et le numéro de carte. 
-                        Réponds UNIQUEMENT par un objet JSON valide, sans aucune phrase autour : {"set": "nom-extension-en-anglais", "number": "123"}. 
-                        Si incertain, renvoie {"set": null, "number": null}.` 
+                        "text": `Expert Pokémon. Analyse cette image et le titre "${title}". 
+                        Extrais le nom de l'extension et le numéro de la carte.
+                        Réponds UNIQUEMENT par un JSON pur sans texte : {"set": "nom-extension-anglais", "number": "123"}.` 
                     },
                     { "type": "image_url", "image_url": { "url": imageUrl } }
                 ]
@@ -83,7 +82,6 @@ app.post('/api/analyser', async (req, res) => {
         await page.goto(cardInfo.url, { waitUntil: 'domcontentloaded' });
         
         const price = await page.evaluate(() => {
-            // Sélecteur standard Cardmarket pour le prix d'un article unique
             const el = document.querySelector('.price-container .price');
             return el ? el.innerText.trim() : "Prix introuvable";
         });
