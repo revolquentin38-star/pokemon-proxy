@@ -20,19 +20,19 @@ app.post('/api/analyser', async (req, res) => {
     if (!imageUrl) return res.status(400).json({ error: "Image manquante" });
 
     try {
-        // 1. Analyse IA : On demande spécifiquement le nom du Set
+        // 1. Analyse IA : On force la TRADUCTION en anglais
         const completion = await openai.chat.completions.create({
             model: "openai/gpt-4o-mini",
             max_tokens: 150,
             messages: [
                 {
                     role: "system",
-                    content: "Tu es un expert Pokémon. Analyse l'image. Retourne un JSON pur : {'nom': 'nom exact', 'numero': 'numéro', 'set_nom': 'nom de l\'extension'}. Si le set est inconnu, mets 'null'."
+                    content: "Tu es un expert Pokémon TCG. Analyse l'image et le texte. Retourne un JSON pur : {'nom_anglais': 'nom du Pokémon EN ANGLAIS', 'numero': 'juste le chiffre', 'set_nom': 'nom de l\'extension'}. Ex: Si c'est Reptincel, mets 'Charmeleon'."
                 },
                 {
                     role: "user",
                     content: [
-                        { type: "text", text: `Analyse cette carte. Titre Vinted : ${title}. Identifie bien le nom du set/extension.` },
+                        { type: "text", text: `Titre Vinted : ${title}. Donne-moi impérativement le nom de la carte en anglais.` },
                         { type: "image_url", image_url: { url: imageUrl } }
                     ]
                 }
@@ -41,25 +41,23 @@ app.post('/api/analyser', async (req, res) => {
         });
 
         const dataIA = JSON.parse(completion.choices[0].message.content);
-        console.log("IA a identifié :", dataIA);
+        console.log("L'IA a identifié et traduit :", dataIA);
 
-        // 2. Recherche API (Nom + Numéro)
+        // 2. Recherche API avec le nom EN ANGLAIS
         const responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
-            params: { q: `name:"${dataIA.nom}" number:${dataIA.numero}` }
+            params: { q: `name:"${dataIA.nom_anglais}" number:${dataIA.numero}` }
         });
 
         const results = responseAPI.data.data;
         if (!results || results.length === 0) {
-            return res.status(404).json({ success: false, error: "Carte non trouvée" });
+            return res.status(404).json({ success: false, error: "Carte introuvable dans la base" });
         }
 
-        // 3. LOGIQUE DE SÉLECTION INTELLIGENTE
-        // On cherche une carte dont le nom du set correspond à ce que l'IA a trouvé
+        // 3. LOGIQUE DE SÉLECTION (Filtrage par Set + Tri par Prix)
         let foundCard = results.find(c => 
-            c.set.name.toLowerCase().includes(dataIA.set_nom.toLowerCase())
+            dataIA.set_nom && c.set.name.toLowerCase().includes(dataIA.set_nom.toLowerCase())
         );
 
-        // Si on n'a pas trouvé par le nom du set, on trie par prix pour prendre la version la plus probable (la plus chère)
         if (!foundCard) {
             console.log("Aucun match de set exact, tri par prix...");
             foundCard = results.sort((a, b) => 
@@ -71,7 +69,7 @@ app.post('/api/analyser', async (req, res) => {
             res.json({
                 success: true,
                 data: {
-                    nom: foundCard.name,
+                    nom: foundCard.name, // Ça affichera le nom anglais, ex: Charmeleon
                     numero: foundCard.number,
                     set: foundCard.set.name,
                     prix: foundCard.cardmarket?.prices?.averageSellPrice || "N/A"
