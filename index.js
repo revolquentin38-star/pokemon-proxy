@@ -18,19 +18,22 @@ app.post('/api/analyser', async (req, res) => {
     const { imageUrl, title } = req.body;
 
     try {
-        // 1. Analyse par l'IA
+        // 1. Analyse Visuelle : On force l'extraction de l'ID du Set et du numéro
         const completion = await openai.chat.completions.create({
             model: "openai/gpt-4o",
-            max_tokens: 150,
             messages: [
                 {
                     role: "system",
-                    content: "Tu es un expert. Retourne un JSON : {'nom': 'nom du pokémon', 'numero': 'juste le numéro sans le total'}"
+                    content: `Tu es un expert visuel Pokémon. Analyse l'image pour trouver :
+                    1. Le numéro de la carte (ex: 179).
+                    2. Le symbole de l'extension (ex: pour 151, c'est 'sv3'). 
+                    Si tu n'es pas sûr de l'ID du set, donne juste le nom du set.
+                    Retourne uniquement un JSON : {"numero": "...", "set_id": "...", "set_name": "..."}`
                 },
                 {
                     role: "user",
                     content: [
-                        { type: "text", text: `Analyse cette carte. Titre Vinted : ${title}.` },
+                        { type: "text", text: `Analyse cette carte.` },
                         { type: "image_url", image_url: { url: imageUrl } }
                     ]
                 }
@@ -39,32 +42,35 @@ app.post('/api/analyser', async (req, res) => {
         });
 
         const dataIA = JSON.parse(completion.choices[0].message.content);
-        console.log("IA a trouvé :", dataIA);
+        console.log("IA a identifié (Clés uniques) :", dataIA);
 
-        // 2. Recherche large par nom uniquement
-        // On ne met pas le numéro dans la requête pour éviter les 404
-        const responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
-            params: { q: `name:"${dataIA.nom}"` }
+        // 2. Requête ultra-précise par Set ID et Numéro
+        // On essaie d'abord par set.id + number (La méthode des pros)
+        let responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
+            params: { q: `set.id:${dataIA.set_id} number:${dataIA.numero}` }
         });
 
-        // 3. Filtrage intelligent
-        const results = responseAPI.data.data;
-        if (!results || results.length === 0) {
-            return res.status(404).json({ success: false, error: "Carte non trouvée" });
+        // Fallback : Si ça échoue, on cherche juste par numéro + nom partiel
+        if (responseAPI.data.data.length === 0) {
+             responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
+                params: { q: `number:${dataIA.numero} name:"${dataIA.set_name || ''}"` }
+            });
         }
 
-        // On cherche le numéro dans les résultats reçus
-        const card = results.find(c => c.number === dataIA.numero) || results[0];
-        const prix = card.cardmarket?.prices?.averageSellPrice || "N/A";
+        const foundCard = responseAPI.data.data[0];
 
-        res.json({
-            success: true,
-            data: {
-                nom: card.name,
-                numero: card.number,
-                prix: prix
-            }
-        });
+        if (foundCard) {
+            res.json({
+                success: true,
+                data: {
+                    nom: foundCard.name,
+                    numero: foundCard.number,
+                    prix: foundCard.cardmarket?.prices?.averageSellPrice || "N/A"
+                }
+            });
+        } else {
+            res.status(404).json({ success: false, error: "Carte non trouvée via Set ID." });
+        }
 
     } catch (error) {
         console.error("Erreur serveur :", error.message);
@@ -73,5 +79,5 @@ app.post('/api/analyser', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Le serveur écoute sur le port ${PORT}`);
+    console.log(`Serveur prêt sur le port ${PORT}`);
 });
