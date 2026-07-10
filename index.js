@@ -26,7 +26,7 @@ const CardPriceSchema = new mongoose.Schema({
 });
 const CardPrice = mongoose.model('CardPrice', CardPriceSchema);
 
-// Fonction IA via OpenRouter
+// Fonction IA optimisée
 async function getCardIdFromAI(imageUrl, title) {
     console.log("Analyse IA en cours pour :", title);
     try {
@@ -35,13 +35,21 @@ async function getCardIdFromAI(imageUrl, title) {
             "messages": [{
                 "role": "user",
                 "content": [
-                    { "type": "text", "text": `Analyse cette carte Pokémon. Donne le nom de l'extension et le numéro au format JSON : {"set": "nom-extension", "number": "123"}. Si impossible, renvoie {"set": null}.` },
+                    { 
+                        "type": "text", 
+                        "text": `Tu es un expert Pokémon. Analyse l'image et le titre "${title}". 
+                        Extrais le nom de l'extension et le numéro de carte. 
+                        Réponds UNIQUEMENT par un objet JSON valide, sans aucune phrase autour : {"set": "nom-extension-en-anglais", "number": "123"}. 
+                        Si incertain, renvoie {"set": null, "number": null}.` 
+                    },
                     { "type": "image_url", "image_url": { "url": imageUrl } }
                 ]
             }]
         }, { headers: { "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}` } });
 
-        const result = JSON.parse(response.data.choices[0].message.content);
+        const content = response.data.choices[0].message.content.replace(/```json|```/g, "").trim();
+        const result = JSON.parse(content);
+        
         if (!result.set) return null;
 
         const formattedSet = result.set.replace(/\s+/g, '-');
@@ -57,11 +65,9 @@ app.post('/api/analyser', async (req, res) => {
         
         if (!cardInfo) return res.json({ success: false, error: "IA n'a pas pu identifier la carte" });
 
-        // Vérif MongoDB
         const cachedCard = await CardPrice.findOne({ cardId: cardInfo.cardId });
         if (cachedCard) return res.json({ success: true, data: { price: cachedCard.price, source: "cache" } });
 
-        // Scraping Puppeteer
         const browser = await puppeteer.launch({
             headless: true,
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
@@ -77,7 +83,8 @@ app.post('/api/analyser', async (req, res) => {
         await page.goto(cardInfo.url, { waitUntil: 'domcontentloaded' });
         
         const price = await page.evaluate(() => {
-            const el = document.querySelector('.price-container .price'); // Sélecteur Cardmarket à ajuster si besoin
+            // Sélecteur standard Cardmarket pour le prix d'un article unique
+            const el = document.querySelector('.price-container .price');
             return el ? el.innerText.trim() : "Prix introuvable";
         });
 
