@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { OpenAI } = require('openai');
-const axios = require('axios'); // Assure-toi d'avoir axios d'installé
+const axios = require('axios'); 
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,7 +9,6 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Configuration stricte pour OpenRouter
 const openai = new OpenAI({
     apiKey: process.env.OPENROUTER_API_KEY,
     baseURL: "https://openrouter.ai/api/v1",
@@ -19,15 +18,15 @@ app.post('/api/analyser', async (req, res) => {
     const { imageUrl, title } = req.body;
 
     try {
-        // 1. Identification de la carte via l'IA Vision (OpenRouter)
+        // 1. Identification via l'IA Vision
         const completion = await openai.chat.completions.create({
-            model: "openai/gpt-4o", // Le modèle exact attendu par OpenRouter
-            max_tokens: 150,        // <-- AJOUT : Limite la longueur pour éviter l'erreur 402 de crédits
+            model: "openai/gpt-4o",
+            max_tokens: 150,
             messages: [
                 {
                     role: "user",
                     content: [
-                        { type: "text", text: `Identifie cette carte Pokémon. Titre Vinted : ${title}. Retourne UNIQUEMENT un objet JSON avec ce format exact : {"nom": "nom exact du pokemon en anglais", "numero": "numero/total"}` },
+                        { type: "text", text: `Identifie cette carte Pokémon. Titre Vinted : ${title}. Retourne UNIQUEMENT un objet JSON avec ce format exact : {"nom": "nom exact du pokemon en anglais (ex: Mr. Mime)", "numero": "numéro de la carte SEUL, sans le total et sans slash (ex: 179)"}` },
                         { type: "image_url", image_url: { url: imageUrl } }
                     ]
                 }
@@ -39,13 +38,16 @@ app.post('/api/analyser', async (req, res) => {
         console.log("Données de l'IA reçues :", dataIA);
 
         // 2. Recherche du prix sur l'API Pokémon TCG
-        const url = `https://api.pokemontcg.io/v2/cards?q=name:"${dataIA.nom}" number:${dataIA.numero}`;
-        const responseAPI = await axios.get(url);
+        // Utilisation des "params" d'Axios pour encoder proprement les espaces et caractères spéciaux
+        const responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
+            params: {
+                q: `name:"${dataIA.nom}" number:${dataIA.numero}`
+            }
+        });
 
         if (responseAPI.data.data && responseAPI.data.data.length > 0) {
             const card = responseAPI.data.data[0];
             
-            // On vérifie si Cardmarket donne un prix, sinon on indique que ce n'est pas disponible
             const prix = card.cardmarket && card.cardmarket.prices ? card.cardmarket.prices.averageSellPrice : "N/A";
 
             res.json({
@@ -64,11 +66,13 @@ app.post('/api/analyser', async (req, res) => {
         }
 
     } catch (error) {
-        console.error("Erreur serveur :", error);
-        // On renvoie l'erreur détaillée pour l'afficher dans Chrome si OpenRouter bloque
+        // Ajout d'un log plus précis si c'est Axios qui plante
+        const errorMessage = error.response?.data?.error?.message || error.message || "Erreur interne.";
+        console.error("Erreur serveur :", errorMessage);
+        
         res.status(500).json({ 
             success: false, 
-            error: error.message || "Erreur interne du serveur lors de l'analyse." 
+            error: errorMessage
         });
     }
 });
