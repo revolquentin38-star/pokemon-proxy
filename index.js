@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Configuration OpenAI / OpenRouter
 const openai = new OpenAI({
     apiKey: process.env.OPENROUTER_API_KEY,
     baseURL: "https://openrouter.ai/api/v1",
@@ -17,23 +18,24 @@ const openai = new OpenAI({
 app.post('/api/analyser', async (req, res) => {
     const { imageUrl, title } = req.body;
 
+    if (!imageUrl) {
+        return res.status(400).json({ success: false, error: "Image manquante" });
+    }
+
     try {
-        // 1. Analyse Visuelle : On force l'extraction de l'ID du Set et du numéro
+        // 1. Analyse IA (Optimisée : gpt-4o-mini + tokens limités)
         const completion = await openai.chat.completions.create({
-            model: "openai/gpt-4o",
+            model: "openai/gpt-4o-mini",
+            max_tokens: 150, 
             messages: [
                 {
                     role: "system",
-                    content: `Tu es un expert visuel Pokémon. Analyse l'image pour trouver :
-                    1. Le numéro de la carte (ex: 179).
-                    2. Le symbole de l'extension (ex: pour 151, c'est 'sv3'). 
-                    Si tu n'es pas sûr de l'ID du set, donne juste le nom du set.
-                    Retourne uniquement un JSON : {"numero": "...", "set_id": "...", "set_name": "..."}`
+                    content: "Tu es un expert Pokémon TCG. Analyse l'image. Retourne UN UNIQUE JSON : {'nom': 'nom exact', 'numero': 'numéro', 'set_id': 'code de set si visible, sinon null'}. Ne réponds qu'avec le JSON."
                 },
                 {
                     role: "user",
                     content: [
-                        { type: "text", text: `Analyse cette carte.` },
+                        { type: "text", text: `Analyse cette carte. Titre Vinted : ${title}` },
                         { type: "image_url", image_url: { url: imageUrl } }
                     ]
                 }
@@ -42,18 +44,24 @@ app.post('/api/analyser', async (req, res) => {
         });
 
         const dataIA = JSON.parse(completion.choices[0].message.content);
-        console.log("IA a identifié (Clés uniques) :", dataIA);
+        console.log("Analyse IA :", dataIA);
 
-        // 2. Requête ultra-précise par Set ID et Numéro
-        // On essaie d'abord par set.id + number (La méthode des pros)
-        let responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
-            params: { q: `set.id:${dataIA.set_id} number:${dataIA.numero}` }
-        });
+        // 2. Recherche API (Tentative avec Set ID pour une précision maximale)
+        let responseAPI;
+        if (dataIA.set_id) {
+            try {
+                responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
+                    params: { q: `set.id:${dataIA.set_id} number:${dataIA.numero}` }
+                });
+            } catch (e) {
+                console.log("Recherche par Set ID échouée, passage au fallback.");
+            }
+        }
 
-        // Fallback : Si ça échoue, on cherche juste par numéro + nom partiel
-        if (responseAPI.data.data.length === 0) {
-             responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
-                params: { q: `number:${dataIA.numero} name:"${dataIA.set_name || ''}"` }
+        // 3. Fallback : Si aucune carte trouvée, on cherche par Nom + Numéro
+        if (!responseAPI || responseAPI.data.data.length === 0) {
+            responseAPI = await axios.get('https://api.pokemontcg.io/v2/cards', {
+                params: { q: `name:"${dataIA.nom}" number:${dataIA.numero}` }
             });
         }
 
@@ -65,19 +73,20 @@ app.post('/api/analyser', async (req, res) => {
                 data: {
                     nom: foundCard.name,
                     numero: foundCard.number,
+                    set: foundCard.set.name,
                     prix: foundCard.cardmarket?.prices?.averageSellPrice || "N/A"
                 }
             });
         } else {
-            res.status(404).json({ success: false, error: "Carte non trouvée via Set ID." });
+            res.status(404).json({ success: false, error: "Carte introuvable dans la base officielle" });
         }
 
     } catch (error) {
         console.error("Erreur serveur :", error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: "Erreur serveur interne" });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Serveur prêt sur le port ${PORT}`);
+    console.log(`Serveur prêt et optimisé sur le port ${PORT}`);
 });
