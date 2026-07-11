@@ -97,7 +97,9 @@ async function ecrireCache(name, number, language, price, url) {
 
 async function getCardIdFromAI(imageUrl, title) {
     const prompt = `Identifie cette carte Pokémon à partir de l'image (le titre de l'annonce est un complément d'info, en français). Réponds UNIQUEMENT en JSON strict, sans texte ni markdown autour, format exact :
-{"name": "Nom anglais de la carte", "number": "numéro de collection sans le total (ex: 25 et pas 25/102)", "language": "EN"}
+{"name": "Nom anglais de la carte", "number": "numéro de collection sans le total (ex: 25 et pas 25/102)", "setCode": "code du set (ex: BLK, PAL, OBF) si visible sur la carte ou dans le titre, sinon null", "language": "EN"}
+
+Le "setCode" est le petit code alphabétique (2 à 4 lettres) imprimé en bas de la carte à côté du numéro de collection, ou parfois présent dans le titre de l'annonce juste avant le numéro (ex: "BLK 129"). Si tu ne le vois pas clairement, réponds null pour ce champ, n'invente rien.
 
 Pour "language", déduis-la du TEXTE VISIBLE SUR LA CARTE elle-même (pas du titre) : JP si texte japonais, FR si texte français, DE si allemand, IT si italien, ES si espagnol, PT si portugais, KR si coréen, ZH si chinois. Si tu n'es pas sûr, réponds "EN" par défaut.
 
@@ -151,27 +153,44 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
 // ÉTAPE 2 — Trouver la fiche produit sur Cardmarket (sans passer par Google)
 // ============================================================
 
-async function trouverUrlCardmarket(name, number) {
-    const recherche = `${name} ${number}`;
+async function essayerRechercheCardmarket(recherche) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true`;
+    // wait_for_selector : on attend que les résultats (des liens vers des fiches produit)
+    // soient réellement présents dans le DOM avant que ScraperAPI ne nous rende le HTML.
+    // Sans ça, on récupère parfois la page avant la fin du chargement Ajax des résultats.
+    const waitFor = encodeURIComponent('a[href*="Products/Singles"]');
+    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true&wait_for_selector=${waitFor}`;
 
+    const response = await axios.get(scraperUrl, { timeout: 60000 });
+    const html = String(response.data);
+    const $ = cheerio.load(html);
+
+    let lien = $('a[href*="/Products/Singles/"]').first().attr('href');
+
+    if (!lien) {
+        console.error(`⚠️ Aucun lien produit pour la recherche "${recherche}".`);
+        console.error(`   Titre de la page reçue : "${$('title').text().trim()}"`);
+        console.error(`   Taille HTML : ${html.length} caractères.`);
+        const bloque = /cloudflare|attention required|checking your browser|access denied|captcha/i.test(html);
+        if (bloque) console.error("   ⚠️ La page ressemble à une page de blocage anti-bot.");
+        return null;
+    }
+
+    if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
+    console.log(`🔗 Fiche Cardmarket trouvée pour "${recherche}" : ${lien}`);
+    return lien;
+}
+
+async function trouverUrlCardmarket(name, number, setCode) {
     try {
-        const response = await axios.get(scraperUrl, { timeout: 60000 });
-        const $ = cheerio.load(response.data);
-
-        // On cherche un lien de fiche produit singles
-        let lien = $('a[href*="/Products/Singles/"]').first().attr('href');
-
-        if (!lien) {
-            console.error(`⚠️ Aucun lien produit trouvé pour "${recherche}". Taille HTML reçue: ${response.data?.length || 0} caractères.`);
-            console.error("Extrait HTML (debug):", String(response.data).slice(0, 500));
-            return null;
+        // Essai 1 : "code de set + numéro" (ex: "BLK 129") — format le plus fiable sur Cardmarket
+        if (setCode) {
+            const lien = await essayerRechercheCardmarket(`${setCode} ${number}`);
+            if (lien) return lien;
         }
 
-        if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
-        console.log(`🔗 Fiche Cardmarket trouvée: ${lien}`);
-        return lien;
+        // Essai 2 (repli) : "nom + numéro"
+        return await essayerRechercheCardmarket(`${name} ${number}`);
 
     } catch (e) {
         console.error("❌ Erreur trouverUrlCardmarket:", e.response?.status, e.message);
@@ -184,7 +203,8 @@ async function trouverUrlCardmarket(name, number) {
 // ============================================================
 
 async function getPrixDepuisFiche(url) {
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true`;
+    const waitFor = encodeURIComponent('.price-container, [data-testid="price"], .info-list-price-value');
+    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true&wait_for_selector=${waitFor}`;
 
     try {
         const response = await axios.get(scraperUrl, { timeout: 60000 });
@@ -219,7 +239,9 @@ async function getPrixDepuisFiche(url) {
         }
 
         if (!prixTexte) {
-            console.error(`❌ Aucun prix trouvé sur ${url}. Taille HTML: ${html.length} caractères.`);
+            console.error(`❌ Aucun prix trouvé sur ${url}.`);
+            console.error(`   Titre de la page reçue : "${$('title').text().trim()}"`);
+            console.error(`   Taille HTML : ${html.length} caractères.`);
             return null;
         }
 
@@ -278,9 +300,9 @@ app.post('/api/analyser', async (req, res) => {
 
         // 2. Sinon on scrape
         if (!resultat) {
-            const urlFiche = await trouverUrlCardmarket(cardInfo.name, cardInfo.number);
+            const urlFiche = await trouverUrlCardmarket(cardInfo.name, cardInfo.number, cardInfo.setCode);
             if (!urlFiche) {
-                return res.json({ success: false, error: `Carte "${cardInfo.name} #${cardInfo.number}" non trouvée sur Cardmarket` });
+                return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée sur Cardmarket` });
             }
 
             const prix = await getPrixDepuisFiche(urlFiche);
