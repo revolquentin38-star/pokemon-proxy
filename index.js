@@ -155,7 +155,7 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
 
 async function essayerRechercheCardmarket(recherche) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
-    const waitFor = encodeURIComponent('a[href*="Products/Singles"]');
+    const waitFor = encodeURIComponent('a[href*="Pokemon/Cards"]');
     const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true&wait_for_selector=${waitFor}`;
 
     try {
@@ -163,7 +163,7 @@ async function essayerRechercheCardmarket(recherche) {
         const html = String(response.data);
         const $ = cheerio.load(html);
 
-        let lien = $('a[href*="/Products/Singles/"]').first().attr('href');
+        let lien = $('a[href*="/Pokemon/Cards/"]').first().attr('href');
 
         if (!lien) {
             console.error(`⚠️ Aucun lien produit pour la recherche "${recherche}" (page chargée mais rien trouvé).`);
@@ -187,7 +187,7 @@ async function essayerRechercheCardmarket(recherche) {
 
 async function essayerRechercheParNomSeul(name, number) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(name)}`;
-    const waitFor = encodeURIComponent('a[href*="Products/Singles"]');
+    const waitFor = encodeURIComponent('a[href*="Pokemon/Cards"]');
     const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true&wait_for_selector=${waitFor}`;
 
     try {
@@ -195,7 +195,7 @@ async function essayerRechercheParNomSeul(name, number) {
         const html = String(response.data);
         const $ = cheerio.load(html);
 
-        const liens = $('a[href*="/Products/Singles/"]').toArray();
+        const liens = $('a[href*="/Pokemon/Cards/"]').toArray();
         if (liens.length === 0) {
             console.error(`⚠️ Recherche par nom seul "${name}" : aucun résultat.`);
             console.error(`   Titre de la page : "${$('title').text().trim()}" — Taille HTML : ${html.length} caractères.`);
@@ -245,7 +245,7 @@ async function trouverUrlCardmarket(name, number, setCode) {
 // ============================================================
 
 async function getPrixDepuisFiche(url) {
-    const waitFor = encodeURIComponent('.price-container, [data-testid="price"], .info-list-price-value');
+    const waitFor = encodeURIComponent('dl, .price-container, [data-testid="price"]');
     const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true&wait_for_selector=${waitFor}`;
 
     try {
@@ -253,25 +253,39 @@ async function getPrixDepuisFiche(url) {
         const html = String(response.data);
         const $ = cheerio.load(html);
 
-        // Plan A : sélecteurs les plus probables sur une fiche Cardmarket.
-        // ⚠️ Cardmarket change parfois ses classes CSS — si ça ne marche pas,
-        // ouvre la fiche produit dans ton navigateur, fais F12, clique sur le
-        // prix affiché, et remplace le(s) sélecteur(s) ci-dessous par le bon.
-        const selecteursCandidats = [
-            '.price-container .price',
-            '[data-testid="price"]',
-            '.info-list-price-value',
-            '.price-guide .price'
-        ];
-
-        let prixTexte = null;
-        for (const sel of selecteursCandidats) {
-            const texte = $(sel).first().text().trim();
-            if (texte) { prixTexte = texte; console.log(`✅ Prix trouvé via le sélecteur "${sel}": ${texte}`); break; }
+        // Plan A : la fiche produit Cardmarket présente ses infos en paires <dt>/<dd>
+        // (ex: <dt>Tendance des prix</dt><dd>29,99 €</dd>). Confirmé sur le HTML réel.
+        // On cherche par ordre de préférence : la tendance, puis la moyenne 7 jours,
+        // puis la moyenne 30 jours — la tendance reflète le mieux le prix actuel.
+        function chercherParLabel(libelles) {
+            let resultat = null;
+            $('dt').each((i, el) => {
+                const texteLabel = $(el).text().trim().toLowerCase();
+                if (libelles.some(l => texteLabel.includes(l))) {
+                    const valeur = $(el).next('dd').text().trim();
+                    if (valeur) { resultat = { label: texteLabel, valeur }; return false; }
+                }
+            });
+            return resultat;
         }
 
-        // Plan B (secours) : on cherche un motif de prix en euros dans le HTML brut.
-        // Moins fiable, mais évite un échec total si les classes CSS ont changé.
+        let trouve = chercherParLabel(['tendance des prix', 'price trend'])
+            || chercherParLabel(['prix moyen 7 jours', '7-days average', '7 days average'])
+            || chercherParLabel(['prix moyen 30 jours', '30-days average', '30 days average']);
+
+        let prixTexte = trouve?.valeur || null;
+        if (prixTexte) console.log(`✅ Prix trouvé via le libellé "${trouve.label}": ${prixTexte}`);
+
+        // Plan B : anciens sélecteurs CSS (au cas où la structure dt/dd ne matche pas)
+        if (!prixTexte) {
+            const selecteursCandidats = ['.price-container .price', '[data-testid="price"]', '.info-list-price-value', '.price-guide .price'];
+            for (const sel of selecteursCandidats) {
+                const texte = $(sel).first().text().trim();
+                if (texte) { prixTexte = texte; console.log(`✅ Prix trouvé via le sélecteur "${sel}": ${texte}`); break; }
+            }
+        }
+
+        // Plan C (dernier secours) : motif de prix en euros dans le HTML brut
         if (!prixTexte) {
             const match = html.match(/(\d+[.,]\d{2})\s*€/);
             if (match) {
