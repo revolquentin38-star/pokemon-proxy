@@ -264,6 +264,7 @@ app.post('/api/analyser', async (req, res) => {
         const { imageUrl, title, vintedPrice } = req.body;
 
         if (!imageUrl) {
+            console.error("⚠️ Requête reçue sans imageUrl. Body reçu:", req.body);
             return res.json({ success: false, error: "Aucune image reçue" });
         }
 
