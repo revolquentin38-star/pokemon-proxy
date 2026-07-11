@@ -155,47 +155,89 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
 
 async function essayerRechercheCardmarket(recherche) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
-    // wait_for_selector : on attend que les résultats (des liens vers des fiches produit)
-    // soient réellement présents dans le DOM avant que ScraperAPI ne nous rende le HTML.
-    // Sans ça, on récupère parfois la page avant la fin du chargement Ajax des résultats.
     const waitFor = encodeURIComponent('a[href*="Products/Singles"]');
     const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true&wait_for_selector=${waitFor}`;
 
-    const response = await axios.get(scraperUrl, { timeout: 60000 });
-    const html = String(response.data);
-    const $ = cheerio.load(html);
+    try {
+        const response = await axios.get(scraperUrl, { timeout: 60000 });
+        const html = String(response.data);
+        const $ = cheerio.load(html);
 
-    let lien = $('a[href*="/Products/Singles/"]').first().attr('href');
+        let lien = $('a[href*="/Products/Singles/"]').first().attr('href');
 
-    if (!lien) {
-        console.error(`⚠️ Aucun lien produit pour la recherche "${recherche}".`);
-        console.error(`   Titre de la page reçue : "${$('title').text().trim()}"`);
-        console.error(`   Taille HTML : ${html.length} caractères.`);
-        const bloque = /cloudflare|attention required|checking your browser|access denied|captcha/i.test(html);
-        if (bloque) console.error("   ⚠️ La page ressemble à une page de blocage anti-bot.");
+        if (!lien) {
+            console.error(`⚠️ Aucun lien produit pour la recherche "${recherche}" (page chargée mais rien trouvé).`);
+            console.error(`   Titre de la page : "${$('title').text().trim()}" — Taille HTML : ${html.length} caractères.`);
+            return null;
+        }
+
+        if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
+        console.log(`🔗 Fiche Cardmarket trouvée pour "${recherche}" : ${lien}`);
+        return lien;
+
+    } catch (e) {
+        // ScraperAPI renvoie souvent une erreur (ex: 500) quand wait_for_selector
+        // n'apparaît jamais dans le délai imparti — typiquement quand la recherche
+        // ne donne vraiment aucun résultat. On traite ça comme "pas trouvé" pour
+        // cette tentative précise, SANS empêcher le repli suivant de s'exécuter.
+        console.error(`⚠️ Requête ScraperAPI en échec pour "${recherche}" : ${e.response?.status || ''} ${e.message}`);
         return null;
     }
+}
 
-    if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
-    console.log(`🔗 Fiche Cardmarket trouvée pour "${recherche}" : ${lien}`);
-    return lien;
+async function essayerRechercheParNomSeul(name, number) {
+    const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(name)}`;
+    const waitFor = encodeURIComponent('a[href*="Products/Singles"]');
+    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true&wait_for_selector=${waitFor}`;
+
+    try {
+        const response = await axios.get(scraperUrl, { timeout: 60000 });
+        const html = String(response.data);
+        const $ = cheerio.load(html);
+
+        const liens = $('a[href*="/Products/Singles/"]').toArray();
+        if (liens.length === 0) {
+            console.error(`⚠️ Recherche par nom seul "${name}" : aucun résultat.`);
+            console.error(`   Titre de la page : "${$('title').text().trim()}" — Taille HTML : ${html.length} caractères.`);
+            return null;
+        }
+
+        console.log(`ℹ️ Recherche par nom seul "${name}" : ${liens.length} résultat(s) trouvé(s), on filtre par numéro "${number}".`);
+
+        // On cherche, parmi tous les résultats, celui dont le texte ou l'URL contient le numéro
+        const motifsNumero = [`/${number}`, `-${number}`, ` ${number}`, `#${number}`];
+        const correspondance = liens.find(el => {
+            const contenu = `${$(el).text()} ${$(el).attr('href') || ''}`;
+            return motifsNumero.some(motif => contenu.includes(motif));
+        });
+
+        const choisi = correspondance || liens[0];
+        if (!correspondance) console.warn(`⚠️ Aucun résultat ne correspond exactement au numéro "${number}" — on prend le 1er résultat par défaut (à vérifier).`);
+
+        let lien = $(choisi).attr('href');
+        if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
+        console.log(`🔗 Fiche Cardmarket retenue (repli nom seul) : ${lien}`);
+        return lien;
+
+    } catch (e) {
+        console.error(`⚠️ Requête ScraperAPI en échec pour la recherche par nom seul "${name}" : ${e.response?.status || ''} ${e.message}`);
+        return null;
+    }
 }
 
 async function trouverUrlCardmarket(name, number, setCode) {
-    try {
-        // Essai 1 : "code de set + numéro" (ex: "BLK 129") — format le plus fiable sur Cardmarket
-        if (setCode) {
-            const lien = await essayerRechercheCardmarket(`${setCode} ${number}`);
-            if (lien) return lien;
-        }
-
-        // Essai 2 (repli) : "nom + numéro"
-        return await essayerRechercheCardmarket(`${name} ${number}`);
-
-    } catch (e) {
-        console.error("❌ Erreur trouverUrlCardmarket:", e.response?.status, e.message);
-        return null;
+    // Essai 1 : "code de set + numéro" (ex: "BLK 129") — format le plus fiable sur Cardmarket
+    if (setCode) {
+        const lien = await essayerRechercheCardmarket(`${setCode} ${number}`);
+        if (lien) return lien;
     }
+
+    // Essai 2 : "nom + numéro"
+    const lien2 = await essayerRechercheCardmarket(`${name} ${number}`);
+    if (lien2) return lien2;
+
+    // Essai 3 (dernier repli) : nom seul, puis filtrage manuel des résultats par numéro
+    return await essayerRechercheParNomSeul(name, number);
 }
 
 // ============================================================
