@@ -8,9 +8,12 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.22.2",
+    "jimp": "^1.6.1",
     "mongoose": "^9.7.4",
     "openai": "^6.46.0",
-    "puppeteer": "^25.3.0"
+    "puppeteer": "^25.3.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "scripts": {
     "start": "node index.js"

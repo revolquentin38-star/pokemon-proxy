@@ -154,13 +154,74 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
 // Docs : https://tcgdex.dev/markets-prices — prix Cardmarket inclus directement.
 // ============================================================
 
+const Jimp = require('jimp');
+
+// Hash perceptif simple (difference hash 8x8 = 64 bits) — permet de comparer
+// deux images visuellement sans dépendance native (contrairement à sharp),
+// pour ne pas revivre le calvaire d'installation qu'on a eu avec Puppeteer/Chrome.
+async function calculerHashImage(urlImage) {
+    const image = await Jimp.read(urlImage);
+    image.resize(9, 8).greyscale();
+    let hash = '';
+    for (let y = 0; y < 8; y++) {
+        for (let x = 0; x < 8; x++) {
+            const gauche = Jimp.intToRGBA(image.getPixelColor(x, y)).r;
+            const droite = Jimp.intToRGBA(image.getPixelColor(x + 1, y)).r;
+            hash += gauche > droite ? '1' : '0';
+        }
+    }
+    return hash;
+}
+
+function distanceHamming(hashA, hashB) {
+    let distance = 0;
+    for (let i = 0; i < hashA.length; i++) if (hashA[i] !== hashB[i]) distance++;
+    return distance;
+}
+
+// Seuil empirique sur 64 bits : en dessous, on considère que c'est vraiment la
+// même illustration (malgré les différences éclairage/angle/protège-carte entre
+// la photo Vinted et l'image de référence propre). À ajuster selon les retours.
+const SEUIL_HASH_CONFIANT = 20;
+
+async function departagerParImage(imageUrlVinted, candidats) {
+    if (!imageUrlVinted) return null;
+    try {
+        const hashVinted = await calculerHashImage(imageUrlVinted);
+        let meilleur = null;
+        let meilleureDistance = Infinity;
+
+        for (const candidat of candidats) {
+            if (!candidat.image) continue;
+            try {
+                const hashCandidat = await calculerHashImage(`${candidat.image}/low.webp`);
+                const distance = distanceHamming(hashVinted, hashCandidat);
+                console.log(`🖼️ Distance image "${candidat.id}" : ${distance}/64`);
+                if (distance < meilleureDistance) { meilleureDistance = distance; meilleur = candidat; }
+            } catch (e) {
+                console.log(`⚠️ Comparaison image impossible pour "${candidat.id}" : ${e.message}`);
+            }
+        }
+
+        if (meilleur) {
+            const confiant = meilleureDistance <= SEUIL_HASH_CONFIANT;
+            console.log(`🖼️ Meilleure correspondance : "${meilleur.id}" (distance ${meilleureDistance}/64)${confiant ? '' : ' — encore incertain'}`);
+            return { candidat: meilleur, confiant };
+        }
+        return null;
+    } catch (e) {
+        console.log(`⚠️ Erreur hash de l'image Vinted : ${e.message}`);
+        return null;
+    }
+}
+
 async function chercherCartesTCGdex(name, numberFilter) {
     const url = `https://api.tcgdex.net/v2/en/cards?name=${encodeURIComponent(name)}&localId=${numberFilter}`;
     const response = await axios.get(url, { timeout: 15000 });
     return Array.isArray(response.data) ? response.data : [];
 }
 
-async function trouverCarteTCGdex(name, number, setCode) {
+async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted) {
     try {
         // Essai 1 : numéro en filtre strict (eq:)
         let resultats = await chercherCartesTCGdex(name, `eq:${encodeURIComponent(number)}`);
@@ -178,17 +239,34 @@ async function trouverCarteTCGdex(name, number, setCode) {
         }
 
         let choisi = resultats[0];
+        let ambigu = false;
+
         if (resultats.length > 1) {
             console.log(`ℹ️ TCGdex : ${resultats.length} résultats pour "${name}" #${number} :`, resultats.map(r => r.id));
-            // Si on a le code du set, on s'en sert pour départager plusieurs correspondances
-            if (setCode) {
-                const correspondance = resultats.find(r => r.id.toLowerCase().includes(setCode.toLowerCase()));
-                if (correspondance) choisi = correspondance;
+
+            // 1er départage : le code du set détecté par l'IA
+            const correspondance = setCode ? resultats.find(r => r.id.toLowerCase().includes(setCode.toLowerCase())) : null;
+
+            if (correspondance) {
+                choisi = correspondance;
+            } else {
+                // 2e départage : comparaison visuelle avec la photo Vinted (comme PokéCardex)
+                console.log(`ℹ️ Aucune correspondance de set, tentative de départage par image...`);
+                const resultatImage = await departagerParImage(imageUrlVinted, resultats);
+
+                if (resultatImage?.confiant) {
+                    choisi = resultatImage.candidat;
+                } else {
+                    // Toujours utile même si pas "confiant" : au moins un choix informé plutôt qu'au hasard
+                    if (resultatImage) choisi = resultatImage.candidat;
+                    ambigu = true;
+                    console.log(`⚠️ ${resultats.length} impressions possibles pour "${name}" #${number}, résultat incertain même après comparaison d'image.`);
+                }
             }
         }
 
-        console.log(`🔗 Carte TCGdex retenue : ${choisi.id} ("${choisi.name}")`);
-        return choisi.id;
+        console.log(`🔗 Carte TCGdex retenue : ${choisi.id} ("${choisi.name}")${ambigu ? ' [INCERTAIN]' : ''}`);
+        return { id: choisi.id, ambigu };
 
     } catch (e) {
         console.error(`❌ Erreur recherche TCGdex pour "${name}" #${number} :`, e.response?.status, e.message);
@@ -238,12 +316,23 @@ async function getPrixDepuisTCGdex(cardId, name, number) {
 // Si ça échoue, la route principale se rabat automatiquement sur TCGdex.
 // ============================================================
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 
 const USER_AGENT_REALISTE = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 function pageBloqueeParAntiBot(html) {
     return /attention required|checking your browser|access denied|cf-browser-verification|just a moment/i.test(html);
+}
+
+function attendre(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Petite pause aléatoire pour casser le rythme "trop régulier" d'un bot
+function pauseAleatoire(minMs, maxMs) {
+    return attendre(minMs + Math.random() * (maxMs - minMs));
 }
 
 async function ouvrirPage(browser) {
@@ -258,6 +347,7 @@ async function essayerRechercheDirecte(browser, recherche) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
     let page;
     try {
+        await pauseAleatoire(800, 2200); // pause avant de naviguer, comme un humain qui vient de taper sa recherche
         page = await ouvrirPage(browser);
         await page.goto(urlRecherche, { waitUntil: 'networkidle2', timeout: 30000 });
         const html = await page.content();
@@ -289,11 +379,20 @@ async function essayerRechercheDirecte(browser, recherche) {
 async function trouverCarteDirect(name, number, setCode) {
     let browser;
     try {
-        browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        browser = await puppeteer.launch({
+            headless: 'new',
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled', // masque le signal d'automatisation le plus évident
+                '--disable-infobars'
+            ]
+        });
 
         if (setCode) {
             const lien = await essayerRechercheDirecte(browser, `${setCode} ${number}`);
             if (lien) return { lien, browser };
+            await pauseAleatoire(1000, 2500); // pause entre deux tentatives, pas de rafale
         }
         const lien = await essayerRechercheDirecte(browser, `${name} ${number}`);
         if (lien) return { lien, browser };
@@ -395,25 +494,28 @@ async function getPrixDirect(browser, url, language) {
 
 
 
-function calculerVerdict(prixVinted, prixCardmarket, language) {
+function calculerVerdict(prixVinted, prixCardmarket, language, carteIncertaine) {
     if (!prixVinted || isNaN(prixVinted)) return null;
     const ratio = prixVinted / prixCardmarket;
     const diffPourcent = Math.round((ratio - 1) * 100);
 
     // Nos sources gratuites (TCGdex/scraping direct) ne filtrent pas toujours
-    // fiablement par langue. Pour une carte non-EN, on ne peut pas garantir que
-    // le prix de référence correspond à la bonne langue -> seuils plus prudents
-    // + avertissement explicite plutôt qu'un faux verdict de confiance.
+    // fiablement par langue, et parfois plusieurs impressions sont ambiguës.
+    // Dans ces deux cas, on ne peut pas garantir que le prix de référence
+    // correspond à la bonne carte/langue -> seuils plus prudents + avertissement
+    // explicite plutôt qu'un faux verdict de confiance. L'incertitude sur la
+    // carte elle-même (mauvais set possible) est encore plus grave que la langue.
     const langueIncertaine = Boolean(language) && language !== 'EN';
-    const seuilBonneAffaire = langueIncertaine ? 0.60 : SEUIL_BONNE_AFFAIRE;
-    const seuilPrixCorrect = langueIncertaine ? 1.30 : SEUIL_PRIX_CORRECT;
+    const incertitude = carteIncertaine || langueIncertaine;
+    const seuilBonneAffaire = carteIncertaine ? 0.50 : (langueIncertaine ? 0.60 : SEUIL_BONNE_AFFAIRE);
+    const seuilPrixCorrect = carteIncertaine ? 1.50 : (langueIncertaine ? 1.30 : SEUIL_PRIX_CORRECT);
 
     let label;
     if (ratio <= seuilBonneAffaire) label = "🔥 Bonne affaire";
     else if (ratio <= seuilPrixCorrect) label = "✅ Prix correct";
     else label = "⚠️ Plus cher que le marché";
 
-    return { label, diffPourcent, langueIncertaine };
+    return { label, diffPourcent, langueIncertaine: incertitude };
 }
 
 // ============================================================
@@ -452,22 +554,27 @@ app.post('/api/analyser', async (req, res) => {
 
             if (!resultat) {
                 console.log("↪️ Repli sur TCGdex (scraping direct indisponible ou bloqué).");
-                const cardId = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode);
-                if (!cardId) {
+                const trouvailleTCGdex = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, imageUrl);
+                if (!trouvailleTCGdex) {
                     return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée (ni en direct, ni sur TCGdex)` });
                 }
-                resultat = await getPrixDepuisTCGdex(cardId, cardInfo.name, cardInfo.number);
+                resultat = await getPrixDepuisTCGdex(trouvailleTCGdex.id, cardInfo.name, cardInfo.number);
+                if (resultat && trouvailleTCGdex.ambigu) resultat.carteIncertaine = true;
             }
 
             if (!resultat) {
                 return res.json({ success: false, error: "Carte trouvée mais aucun prix disponible (voir logs Render)" });
             }
 
-            await ecrireCache(cardInfo.name, cardInfo.number, cardInfo.language, resultat.price, resultat.url);
+            // On ne met pas en cache un résultat incertain (carte potentiellement fausse) —
+            // pas question de figer une possible erreur pendant 24h.
+            if (!resultat.carteIncertaine) {
+                await ecrireCache(cardInfo.name, cardInfo.number, cardInfo.language, resultat.price, resultat.url);
+            }
         }
 
         const prixVintedNombre = vintedPrice ? parseFloat(String(vintedPrice).replace(',', '.')) : null;
-        const verdict = calculerVerdict(prixVintedNombre, resultat.price, cardInfo.language);
+        const verdict = calculerVerdict(prixVintedNombre, resultat.price, cardInfo.language, resultat.carteIncertaine);
 
         res.json({
             success: true,
@@ -479,7 +586,8 @@ app.post('/api/analyser', async (req, res) => {
             vintedPrice: prixVintedNombre,
             verdict: verdict?.label || null,
             diffPourcent: verdict?.diffPourcent ?? null,
-            langueIncertaine: verdict?.langueIncertaine || false
+            langueIncertaine: verdict?.langueIncertaine || false,
+            carteIncertaine: Boolean(resultat.carteIncertaine)
         });
 
     } catch (error) {
