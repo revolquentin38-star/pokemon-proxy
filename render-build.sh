@@ -6,6 +6,10 @@ set -o errexit
 # Installation des dépendances npm
 npm install
 
+# Corrige un souci de permissions fréquent sur Render quand node_modules
+# est repris depuis le cache de build (les binaires perdent leur droit d'exécution)
+chmod +x node_modules/.bin/* 2>/dev/null || true
+
 # S'assure que le dossier de cache Puppeteer existe
 PUPPETEER_CACHE_DIR=/opt/render/.cache/puppeteer
 mkdir -p $PUPPETEER_CACHE_DIR
