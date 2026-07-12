@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const cheerio = require('cheerio');
 const mongoose = require('mongoose');
 
 const app = express();
@@ -28,13 +27,6 @@ const SEUIL_PRIX_CORRECT  = 1.10; // jusqu'à 10% plus cher -> prix correct
 // Si l'extraction se trompe souvent sur des cartes difficiles, remets
 // "~google/gemini-pro-latest" ici (plus précis, plus cher).
 const MODELE_IA = "google/gemini-2.5-flash";
-
-// Cardmarket est protégé par Cloudflare : un render=true basique se fait souvent
-// bloquer/timeout. ScraperAPI recommande premium=true (proxies résidentiels) pour
-// les domaines protégés. ⚠️ Coûte nettement plus de crédits qu'un render=true simple —
-// vérifie ton quota sur dashboard.scraperapi.com. Mets à false si tu veux économiser.
-const PROXY_PREMIUM = true;
-const PARAM_PREMIUM = PROXY_PREMIUM ? '&premium=true' : '';
 
 // ============================================================
 // MONGODB — connexion + schéma de cache
@@ -157,163 +149,85 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
 }
 
 // ============================================================
-// ÉTAPE 2 — Trouver la fiche produit sur Cardmarket (sans passer par Google)
+// ÉTAPE 2 — Trouver la carte et son prix via l'API TCGdex (gratuite, sans clé)
+// Docs : https://tcgdex.dev/markets-prices — prix Cardmarket inclus directement.
 // ============================================================
 
-async function essayerRechercheCardmarket(recherche) {
-    const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true${PARAM_PREMIUM}`;
+async function chercherCartesTCGdex(name, numberFilter) {
+    const url = `https://api.tcgdex.net/v2/en/cards?name=${encodeURIComponent(name)}&localId=${numberFilter}`;
+    const response = await axios.get(url, { timeout: 15000 });
+    return Array.isArray(response.data) ? response.data : [];
+}
 
+async function trouverCarteTCGdex(name, number, setCode) {
     try {
-        const response = await axios.get(scraperUrl, { timeout: 60000 });
-        const html = String(response.data);
-        const $ = cheerio.load(html);
+        // Essai 1 : numéro en filtre strict (eq:)
+        let resultats = await chercherCartesTCGdex(name, `eq:${encodeURIComponent(number)}`);
 
-        let lien = $('a[href*="/Pokemon/Cards/"]').first().attr('href');
+        // Essai 2 (repli) : filtre large, au cas où un zéro de tête ou un format différent bloque le match strict
+        if (resultats.length === 0) {
+            console.log(`ℹ️ TCGdex : 0 résultat en filtre strict pour "${name}" #${number}, nouvel essai en filtre large.`);
+            const numeroSansZeros = number.replace(/^0+/, '') || number;
+            resultats = await chercherCartesTCGdex(name, encodeURIComponent(numeroSansZeros));
+        }
 
-        if (!lien) {
-            console.error(`⚠️ Aucun lien produit pour la recherche "${recherche}" (page chargée mais rien trouvé).`);
-            console.error(`   Titre de la page : "${$('title').text().trim()}" — Taille HTML : ${html.length} caractères.`);
+        if (resultats.length === 0) {
+            console.error(`⚠️ TCGdex : aucun résultat pour "${name}" #${number}.`);
             return null;
         }
 
-        if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
-        console.log(`🔗 Fiche Cardmarket trouvée pour "${recherche}" : ${lien}`);
-        return lien;
-
-    } catch (e) {
-        console.error(`⚠️ Requête ScraperAPI en échec pour "${recherche}" : ${e.response?.status || ''} ${e.message}`);
-        return null;
-    }
-}
-
-async function essayerRechercheParNomSeul(name, number) {
-    const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(name)}`;
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true${PARAM_PREMIUM}`;
-
-    try {
-        const response = await axios.get(scraperUrl, { timeout: 60000 });
-        const html = String(response.data);
-        const $ = cheerio.load(html);
-
-        const liens = $('a[href*="/Pokemon/Cards/"]').toArray();
-        if (liens.length === 0) {
-            console.error(`⚠️ Recherche par nom seul "${name}" : aucun résultat.`);
-            console.error(`   Titre de la page : "${$('title').text().trim()}" — Taille HTML : ${html.length} caractères.`);
-            return null;
-        }
-
-        console.log(`ℹ️ Recherche par nom seul "${name}" : ${liens.length} résultat(s) trouvé(s), on filtre par numéro "${number}".`);
-
-        // On cherche, parmi tous les résultats, celui dont le texte ou l'URL contient le numéro
-        const motifsNumero = [`/${number}`, `-${number}`, ` ${number}`, `#${number}`];
-        const correspondance = liens.find(el => {
-            const contenu = `${$(el).text()} ${$(el).attr('href') || ''}`;
-            return motifsNumero.some(motif => contenu.includes(motif));
-        });
-
-        const choisi = correspondance || liens[0];
-        if (!correspondance) console.warn(`⚠️ Aucun résultat ne correspond exactement au numéro "${number}" — on prend le 1er résultat par défaut (à vérifier).`);
-
-        let lien = $(choisi).attr('href');
-        if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
-        console.log(`🔗 Fiche Cardmarket retenue (repli nom seul) : ${lien}`);
-        return lien;
-
-    } catch (e) {
-        console.error(`⚠️ Requête ScraperAPI en échec pour la recherche par nom seul "${name}" : ${e.response?.status || ''} ${e.message}`);
-        return null;
-    }
-}
-
-async function trouverUrlCardmarket(name, number, setCode) {
-    // Essai 1 : "code de set + numéro" (ex: "BLK 129") — format le plus fiable sur Cardmarket
-    if (setCode) {
-        const lien = await essayerRechercheCardmarket(`${setCode} ${number}`);
-        if (lien) return lien;
-    }
-
-    // Essai 2 : "nom + numéro"
-    const lien2 = await essayerRechercheCardmarket(`${name} ${number}`);
-    if (lien2) return lien2;
-
-    // Essai 3 (dernier repli) : nom seul, puis filtrage manuel des résultats par numéro
-    return await essayerRechercheParNomSeul(name, number);
-}
-
-// ============================================================
-// ÉTAPE 3 — Récupérer le prix sur la fiche produit
-// ============================================================
-
-async function getPrixDepuisFiche(url) {
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true${PARAM_PREMIUM}`;
-
-    try {
-        const response = await axios.get(scraperUrl, { timeout: 60000 });
-        const html = String(response.data);
-        const $ = cheerio.load(html);
-
-        // Plan A : la fiche produit Cardmarket présente ses infos en paires <dt>/<dd>
-        // (ex: <dt>Tendance des prix</dt><dd>29,99 €</dd>). Confirmé sur le HTML réel.
-        // On cherche par ordre de préférence : la tendance, puis la moyenne 7 jours,
-        // puis la moyenne 30 jours — la tendance reflète le mieux le prix actuel.
-        function chercherParLabel(libelles) {
-            let resultat = null;
-            $('dt').each((i, el) => {
-                const texteLabel = $(el).text().trim().toLowerCase();
-                if (libelles.some(l => texteLabel.includes(l))) {
-                    const valeur = $(el).next('dd').text().trim();
-                    if (valeur) { resultat = { label: texteLabel, valeur }; return false; }
-                }
-            });
-            return resultat;
-        }
-
-        let trouve = chercherParLabel(['tendance des prix', 'price trend'])
-            || chercherParLabel(['prix moyen 7 jours', '7-days average', '7 days average'])
-            || chercherParLabel(['prix moyen 30 jours', '30-days average', '30 days average']);
-
-        let prixTexte = trouve?.valeur || null;
-        if (prixTexte) console.log(`✅ Prix trouvé via le libellé "${trouve.label}": ${prixTexte}`);
-
-        // Plan B : anciens sélecteurs CSS (au cas où la structure dt/dd ne matche pas)
-        if (!prixTexte) {
-            const selecteursCandidats = ['.price-container .price', '[data-testid="price"]', '.info-list-price-value', '.price-guide .price'];
-            for (const sel of selecteursCandidats) {
-                const texte = $(sel).first().text().trim();
-                if (texte) { prixTexte = texte; console.log(`✅ Prix trouvé via le sélecteur "${sel}": ${texte}`); break; }
+        let choisi = resultats[0];
+        if (resultats.length > 1) {
+            console.log(`ℹ️ TCGdex : ${resultats.length} résultats pour "${name}" #${number} :`, resultats.map(r => r.id));
+            // Si on a le code du set, on s'en sert pour départager plusieurs correspondances
+            if (setCode) {
+                const correspondance = resultats.find(r => r.id.toLowerCase().includes(setCode.toLowerCase()));
+                if (correspondance) choisi = correspondance;
             }
         }
 
-        // Plan C (dernier secours) : motif de prix en euros dans le HTML brut
-        if (!prixTexte) {
-            const match = html.match(/(\d+[.,]\d{2})\s*€/);
-            if (match) {
-                prixTexte = match[0];
-                console.log(`⚠️ Prix trouvé via le fallback regex (à vérifier): ${prixTexte}`);
-            }
-        }
-
-        if (!prixTexte) {
-            console.error(`❌ Aucun prix trouvé sur ${url}.`);
-            console.error(`   Titre de la page reçue : "${$('title').text().trim()}"`);
-            console.error(`   Taille HTML : ${html.length} caractères.`);
-            return null;
-        }
-
-        const prixNombre = parseFloat(prixTexte.replace(/[^\d,.-]/g, '').replace(',', '.'));
-        if (isNaN(prixNombre)) {
-            console.error(`❌ Impossible de parser le prix "${prixTexte}"`);
-            return null;
-        }
-
-        return prixNombre;
+        console.log(`🔗 Carte TCGdex retenue : ${choisi.id} ("${choisi.name}")`);
+        return choisi.id;
 
     } catch (e) {
-        console.error("❌ Erreur getPrixDepuisFiche:", e.response?.status, e.message);
+        console.error(`❌ Erreur recherche TCGdex pour "${name}" #${number} :`, e.response?.status, e.message);
         return null;
     }
 }
+
+async function getPrixDepuisTCGdex(cardId, name, number) {
+    try {
+        const url = `https://api.tcgdex.net/v2/en/cards/${encodeURIComponent(cardId)}`;
+        const response = await axios.get(url, { timeout: 15000 });
+        const cardmarket = response.data?.pricing?.cardmarket;
+
+        if (!cardmarket) {
+            console.error(`⚠️ TCGdex : pas de données Cardmarket pour "${cardId}" (carte pas encore cotée sur Cardmarket ?).`);
+            return null;
+        }
+
+        // On privilégie la tendance (reflète le mieux le prix actuel), avec replis successifs
+        const prix = cardmarket.trend ?? cardmarket.avg ?? cardmarket['trend-holo'] ?? cardmarket['avg-holo'] ?? cardmarket.avg7 ?? cardmarket.avg30;
+
+        if (typeof prix !== 'number') {
+            console.error(`⚠️ TCGdex : objet cardmarket vide/incomplet pour "${cardId}".`, cardmarket);
+            return null;
+        }
+
+        console.log(`✅ Prix TCGdex/Cardmarket pour "${cardId}" : ${prix} €`);
+
+        // TCGdex ne fournit pas l'URL exacte de la fiche Cardmarket -> on donne un lien de
+        // recherche Cardmarket fonctionnel (pas la fiche exacte, mais jamais cassé).
+        const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(name + ' ' + number)}`;
+
+        return { price: prix, url: urlRecherche };
+
+    } catch (e) {
+        console.error(`❌ Erreur récupération prix TCGdex pour "${cardId}" :`, e.response?.status, e.message);
+        return null;
+    }
+}
+
 
 // ============================================================
 // Verdict "bonne affaire"
@@ -355,20 +269,19 @@ app.post('/api/analyser', async (req, res) => {
         let resultat = debug ? null : await lireCache(cardInfo.name, cardInfo.number, cardInfo.language);
         if (debug) console.log("🐛 Mode debug : lecture du cache sautée.");
 
-        // 2. Sinon on scrape
+        // 2. Sinon on interroge TCGdex (gratuit, pas de clé, prix Cardmarket inclus)
         if (!resultat) {
-            const urlFiche = await trouverUrlCardmarket(cardInfo.name, cardInfo.number, cardInfo.setCode);
-            if (!urlFiche) {
-                return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée sur Cardmarket` });
+            const cardId = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode);
+            if (!cardId) {
+                return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée sur TCGdex` });
             }
 
-            const prix = await getPrixDepuisFiche(urlFiche);
-            if (prix === null) {
-                return res.json({ success: false, error: "Fiche trouvée mais prix illisible (voir logs Render)" });
+            resultat = await getPrixDepuisTCGdex(cardId, cardInfo.name, cardInfo.number);
+            if (!resultat) {
+                return res.json({ success: false, error: "Carte trouvée mais pas de prix Cardmarket disponible (voir logs Render)" });
             }
 
-            resultat = { price: prix, url: urlFiche };
-            await ecrireCache(cardInfo.name, cardInfo.number, cardInfo.language, prix, urlFiche);
+            await ecrireCache(cardInfo.name, cardInfo.number, cardInfo.language, resultat.price, resultat.url);
         }
 
         const prixVintedNombre = vintedPrice ? parseFloat(String(vintedPrice).replace(',', '.')) : null;
