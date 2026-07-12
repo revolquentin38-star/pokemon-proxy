@@ -10,18 +10,14 @@ npm install
 # est repris depuis le cache de build (les binaires perdent leur droit d'exécution)
 chmod +x node_modules/.bin/* 2>/dev/null || true
 
-# S'assure que le dossier de cache Puppeteer existe
-PUPPETEER_CACHE_DIR=/opt/render/.cache/puppeteer
+# IMPORTANT : "export" est nécessaire pour que la commande npx ci-dessous
+# voie bien cette variable (sans ça, Chrome se télécharge au mauvais endroit)
+export PUPPETEER_CACHE_DIR=/opt/render/.cache/puppeteer
 mkdir -p $PUPPETEER_CACHE_DIR
 
 # Télécharge Chrome au bon endroit
 npx puppeteer browsers install chrome
 
-# Persiste le cache Chrome entre les builds (déploiements plus rapides ensuite)
-if [[ ! -d $PUPPETEER_CACHE_DIR/chrome ]]; then
-  echo "...Copie du cache Puppeteer depuis le cache de build"
-  cp -R /opt/render/project/src/.cache/puppeteer/chrome/ $PUPPETEER_CACHE_DIR 2>/dev/null || true
-else
-  echo "...Sauvegarde du cache Puppeteer dans le cache de build"
-  cp -R $PUPPETEER_CACHE_DIR/chrome/ /opt/render/project/src/.cache/puppeteer/ 2>/dev/null || true
-fi
+# Vérification visible dans les logs de build : Chrome est-il bien là où il faut ?
+echo "=== Contenu de $PUPPETEER_CACHE_DIR après installation ==="
+find $PUPPETEER_CACHE_DIR -maxdepth 4 2>/dev/null || echo "⚠️ Dossier introuvable ou vide !"
