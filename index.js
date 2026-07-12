@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const cheerio = require('cheerio');
 const mongoose = require('mongoose');
 
 const app = express();
@@ -230,8 +231,141 @@ async function getPrixDepuisTCGdex(cardId, name, number) {
 
 
 // ============================================================
-// Verdict "bonne affaire"
+// ÉTAPE 2bis — Scraping DIRECT de Cardmarket (sans proxy payant), en complément
+// de TCGdex, pour tenter d'obtenir un prix filtré par langue. Expérimental :
+// peut être bloqué par la protection anti-bot de Cardmarket selon les moments.
+// Si ça échoue, la route principale se rabat automatiquement sur TCGdex.
 // ============================================================
+
+const HEADERS_NAVIGATEUR = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Referer': 'https://www.cardmarket.com/'
+};
+
+function pageBloqueeParAntiBot(html) {
+    return /cloudflare|attention required|checking your browser|access denied|captcha|just a moment/i.test(html);
+}
+
+async function essayerRechercheDirecte(recherche) {
+    const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
+    try {
+        const response = await axios.get(urlRecherche, { headers: HEADERS_NAVIGATEUR, timeout: 15000 });
+        const html = String(response.data);
+
+        if (pageBloqueeParAntiBot(html)) {
+            console.log(`🚫 Scraping direct bloqué (anti-bot) pour "${recherche}".`);
+            return null;
+        }
+
+        const $ = cheerio.load(html);
+        let lien = $('a[href*="/Pokemon/Cards/"]').first().attr('href');
+        if (!lien) return null;
+
+        if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
+        console.log(`🔗 [Direct] Fiche Cardmarket trouvée pour "${recherche}" : ${lien}`);
+        return lien;
+
+    } catch (e) {
+        console.log(`ℹ️ Scraping direct en échec pour "${recherche}" : ${e.response?.status || ''} ${e.message}`);
+        return null;
+    }
+}
+
+async function trouverCarteDirect(name, number, setCode) {
+    if (setCode) {
+        const lien = await essayerRechercheDirecte(`${setCode} ${number}`);
+        if (lien) return lien;
+    }
+    return await essayerRechercheDirecte(`${name} ${number}`);
+}
+
+// Noms de langues (EN + FR, au cas où) à repérer dans les attributs title/alt des
+// icônes de langue sur les lignes d'annonces. À AJUSTER si ça ne matche pas —
+// voir le commentaire dans la réponse pour comment m'envoyer le bon HTML.
+const NOMS_LANGUES = {
+    EN: ['english', 'anglais'],
+    FR: ['french', 'français', 'francais'],
+    DE: ['german', 'allemand'],
+    IT: ['italian', 'italien'],
+    ES: ['spanish', 'espagnol'],
+    JP: ['japanese', 'japonais'],
+    PT: ['portuguese', 'portugais'],
+    KR: ['korean', 'coréen', 'coreen'],
+    ZH: ['chinese', 'chinois']
+};
+
+function extrairePrixParLangue($, language) {
+    const motsCles = NOMS_LANGUES[language];
+    if (!motsCles) return null;
+
+    const prixTrouves = [];
+    $('[title], [alt]').each((i, el) => {
+        const attr = ($(el).attr('title') || $(el).attr('alt') || '').toLowerCase();
+        if (motsCles.some(mot => attr.includes(mot))) {
+            const ligne = $(el).closest('tr, .row, li, article');
+            const texteLigne = ligne.text();
+            const match = texteLigne.match(/(\d+[.,]\d{2})\s*€/);
+            if (match) prixTrouves.push(parseFloat(match[1].replace(',', '.')));
+        }
+    });
+
+    if (prixTrouves.length === 0) return null;
+    prixTrouves.sort((a, b) => a - b);
+    console.log(`🌐 ${prixTrouves.length} annonce(s) en langue "${language}" trouvée(s), prix min: ${prixTrouves[0]} €`);
+    return prixTrouves[0]; // le moins cher parmi les annonces dans la bonne langue
+}
+
+async function getPrixDirect(url, language) {
+    try {
+        const response = await axios.get(url, { headers: HEADERS_NAVIGATEUR, timeout: 15000 });
+        const html = String(response.data);
+
+        if (pageBloqueeParAntiBot(html)) {
+            console.log(`🚫 Scraping direct bloqué (anti-bot) sur la fiche produit.`);
+            return null;
+        }
+
+        const $ = cheerio.load(html);
+
+        // Priorité 1 : prix filtré par langue (si on arrive à le détecter)
+        const prixLangue = language && language !== 'EN' ? extrairePrixParLangue($, language) : null;
+
+        // Priorité 2 : moyenne globale (dt/dd), méthode confirmée fiable précédemment
+        function chercherParLabel(libelles) {
+            let resultat = null;
+            $('dt').each((i, el) => {
+                const texteLabel = $(el).text().trim().toLowerCase();
+                if (libelles.some(l => texteLabel.includes(l))) {
+                    const valeur = $(el).next('dd').text().trim();
+                    if (valeur) { resultat = valeur; return false; }
+                }
+            });
+            return resultat;
+        }
+        const texteAgregat = chercherParLabel(['tendance des prix', 'price trend'])
+            || chercherParLabel(['prix moyen 7 jours', '7-days average']);
+        const prixAgregat = texteAgregat ? parseFloat(texteAgregat.replace(/[^\d,.-]/g, '').replace(',', '.')) : null;
+
+        if (prixLangue !== null) {
+            return { price: prixLangue, url, filtrePar: 'langue' };
+        }
+        if (prixAgregat !== null && !isNaN(prixAgregat)) {
+            if (language && language !== 'EN') console.log(`⚠️ Prix filtré par langue non trouvé pour "${language}", on utilise la moyenne globale à défaut.`);
+            return { price: prixAgregat, url, filtrePar: 'global' };
+        }
+
+        console.log(`⚠️ [Direct] Aucun prix exploitable trouvé sur ${url}.`);
+        return null;
+
+    } catch (e) {
+        console.log(`ℹ️ [Direct] Erreur sur la fiche produit : ${e.response?.status || ''} ${e.message}`);
+        return null;
+    }
+}
+
+
 
 function calculerVerdict(prixVinted, prixCardmarket) {
     if (!prixVinted || isNaN(prixVinted)) return null;
@@ -269,16 +403,25 @@ app.post('/api/analyser', async (req, res) => {
         let resultat = debug ? null : await lireCache(cardInfo.name, cardInfo.number, cardInfo.language);
         if (debug) console.log("🐛 Mode debug : lecture du cache sautée.");
 
-        // 2. Sinon on interroge TCGdex (gratuit, pas de clé, prix Cardmarket inclus)
+        // 2. Sinon : on essaie d'abord le scraping direct (gratuit, peut donner un prix
+        // filtré par langue), puis TCGdex en repli garanti (fiable mais moyenne globale)
         if (!resultat) {
-            const cardId = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode);
-            if (!cardId) {
-                return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée sur TCGdex` });
+            const urlDirect = await trouverCarteDirect(cardInfo.name, cardInfo.number, cardInfo.setCode);
+            if (urlDirect) {
+                resultat = await getPrixDirect(urlDirect, cardInfo.language);
             }
 
-            resultat = await getPrixDepuisTCGdex(cardId, cardInfo.name, cardInfo.number);
             if (!resultat) {
-                return res.json({ success: false, error: "Carte trouvée mais pas de prix Cardmarket disponible (voir logs Render)" });
+                console.log("↪️ Repli sur TCGdex (scraping direct indisponible ou bloqué).");
+                const cardId = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode);
+                if (!cardId) {
+                    return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée (ni en direct, ni sur TCGdex)` });
+                }
+                resultat = await getPrixDepuisTCGdex(cardId, cardInfo.name, cardInfo.number);
+            }
+
+            if (!resultat) {
+                return res.json({ success: false, error: "Carte trouvée mais aucun prix disponible (voir logs Render)" });
             }
 
             await ecrireCache(cardInfo.name, cardInfo.number, cardInfo.language, resultat.price, resultat.url);
