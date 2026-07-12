@@ -339,7 +339,7 @@ function calculerVerdict(prixVinted, prixCardmarket) {
 
 app.post('/api/analyser', async (req, res) => {
     try {
-        const { imageUrl, title, vintedPrice } = req.body;
+        const { imageUrl, title, vintedPrice, debug } = req.body;
 
         if (!imageUrl) {
             console.error("⚠️ Requête reçue sans imageUrl. Body reçu:", req.body);
@@ -351,8 +351,9 @@ app.post('/api/analyser', async (req, res) => {
             return res.json({ success: false, error: "Analyse IA échouée (voir logs Render pour la cause exacte)" });
         }
 
-        // 1. Cache Mongo
-        let resultat = await lireCache(cardInfo.name, cardInfo.number, cardInfo.language);
+        // 1. Cache Mongo (sauté si debug=true, pratique pour retester une carte sans attendre 24h)
+        let resultat = debug ? null : await lireCache(cardInfo.name, cardInfo.number, cardInfo.language);
+        if (debug) console.log("🐛 Mode debug : lecture du cache sautée.");
 
         // 2. Sinon on scrape
         if (!resultat) {
