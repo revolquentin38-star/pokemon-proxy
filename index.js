@@ -231,59 +231,85 @@ async function getPrixDepuisTCGdex(cardId, name, number) {
 
 
 // ============================================================
-// ÉTAPE 2bis — Scraping DIRECT de Cardmarket (sans proxy payant), en complément
-// de TCGdex, pour tenter d'obtenir un prix filtré par langue. Expérimental :
-// peut être bloqué par la protection anti-bot de Cardmarket selon les moments.
+// ÉTAPE 2bis — Scraping DIRECT de Cardmarket via un vrai navigateur headless
+// (Puppeteer), sans proxy payant. Exécute le vrai JS de la page, ce qui passe
+// certaines protections Cloudflare qu'une requête HTTP nue ne passe pas.
+// Reste expérimental : la réputation de l'IP de Render peut quand même bloquer.
 // Si ça échoue, la route principale se rabat automatiquement sur TCGdex.
 // ============================================================
 
-const HEADERS_NAVIGATEUR = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Referer': 'https://www.cardmarket.com/'
-};
+const puppeteer = require('puppeteer');
+
+const USER_AGENT_REALISTE = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 function pageBloqueeParAntiBot(html) {
-    return /cloudflare|attention required|checking your browser|access denied|captcha|just a moment/i.test(html);
+    return /attention required|checking your browser|access denied|cf-browser-verification|just a moment/i.test(html);
 }
 
-async function essayerRechercheDirecte(recherche) {
+async function ouvrirPage(browser) {
+    const page = await browser.newPage();
+    await page.setUserAgent(USER_AGENT_REALISTE);
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7' });
+    return page;
+}
+
+async function essayerRechercheDirecte(browser, recherche) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
+    let page;
     try {
-        const response = await axios.get(urlRecherche, { headers: HEADERS_NAVIGATEUR, timeout: 15000 });
-        const html = String(response.data);
+        page = await ouvrirPage(browser);
+        await page.goto(urlRecherche, { waitUntil: 'networkidle2', timeout: 30000 });
+        const html = await page.content();
 
         if (pageBloqueeParAntiBot(html)) {
-            console.log(`🚫 Scraping direct bloqué (anti-bot) pour "${recherche}".`);
+            console.log(`🚫 [Puppeteer] Bloqué (anti-bot) pour "${recherche}".`);
             return null;
         }
 
         const $ = cheerio.load(html);
         let lien = $('a[href*="/Pokemon/Cards/"]').first().attr('href');
-        if (!lien) return null;
+        if (!lien) {
+            console.log(`⚠️ [Puppeteer] Page chargée mais aucun lien produit pour "${recherche}".`);
+            return null;
+        }
 
         if (lien.startsWith('/')) lien = `https://www.cardmarket.com${lien}`;
-        console.log(`🔗 [Direct] Fiche Cardmarket trouvée pour "${recherche}" : ${lien}`);
+        console.log(`🔗 [Puppeteer] Fiche Cardmarket trouvée pour "${recherche}" : ${lien}`);
         return lien;
 
     } catch (e) {
-        console.log(`ℹ️ Scraping direct en échec pour "${recherche}" : ${e.response?.status || ''} ${e.message}`);
+        console.log(`ℹ️ [Puppeteer] Erreur pour "${recherche}" : ${e.message}`);
         return null;
+    } finally {
+        if (page) await page.close();
     }
 }
 
 async function trouverCarteDirect(name, number, setCode) {
-    if (setCode) {
-        const lien = await essayerRechercheDirecte(`${setCode} ${number}`);
-        if (lien) return lien;
+    let browser;
+    try {
+        browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+
+        if (setCode) {
+            const lien = await essayerRechercheDirecte(browser, `${setCode} ${number}`);
+            if (lien) return { lien, browser };
+        }
+        const lien = await essayerRechercheDirecte(browser, `${name} ${number}`);
+        if (lien) return { lien, browser };
+
+        await browser.close();
+        return null;
+    } catch (e) {
+        console.log(`ℹ️ [Puppeteer] Erreur au lancement du navigateur : ${e.message}`);
+        if (browser) await browser.close();
+        return null;
     }
-    return await essayerRechercheDirecte(`${name} ${number}`);
 }
 
-// Noms de langues (EN + FR, au cas où) à repérer dans les attributs title/alt des
-// icônes de langue sur les lignes d'annonces. À AJUSTER si ça ne matche pas —
-// voir le commentaire dans la réponse pour comment m'envoyer le bon HTML.
+// Noms de langues à repérer dans les attributs title/alt des icônes de langue
+// sur les lignes d'annonces. À AJUSTER si ça ne matche pas — envoie-moi le
+// Ctrl+U d'une ligne d'annonce et on corrige ensemble, comme pour le prix.
 const NOMS_LANGUES = {
     EN: ['english', 'anglais'],
     FR: ['french', 'français', 'francais'],
@@ -314,25 +340,25 @@ function extrairePrixParLangue($, language) {
     if (prixTrouves.length === 0) return null;
     prixTrouves.sort((a, b) => a - b);
     console.log(`🌐 ${prixTrouves.length} annonce(s) en langue "${language}" trouvée(s), prix min: ${prixTrouves[0]} €`);
-    return prixTrouves[0]; // le moins cher parmi les annonces dans la bonne langue
+    return prixTrouves[0];
 }
 
-async function getPrixDirect(url, language) {
+async function getPrixDirect(browser, url, language) {
+    let page;
     try {
-        const response = await axios.get(url, { headers: HEADERS_NAVIGATEUR, timeout: 15000 });
-        const html = String(response.data);
+        page = await ouvrirPage(browser);
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+        const html = await page.content();
 
         if (pageBloqueeParAntiBot(html)) {
-            console.log(`🚫 Scraping direct bloqué (anti-bot) sur la fiche produit.`);
+            console.log(`🚫 [Puppeteer] Bloqué (anti-bot) sur la fiche produit.`);
             return null;
         }
 
         const $ = cheerio.load(html);
 
-        // Priorité 1 : prix filtré par langue (si on arrive à le détecter)
         const prixLangue = language && language !== 'EN' ? extrairePrixParLangue($, language) : null;
 
-        // Priorité 2 : moyenne globale (dt/dd), méthode confirmée fiable précédemment
         function chercherParLabel(libelles) {
             let resultat = null;
             $('dt').each((i, el) => {
@@ -356,29 +382,38 @@ async function getPrixDirect(url, language) {
             return { price: prixAgregat, url, filtrePar: 'global' };
         }
 
-        console.log(`⚠️ [Direct] Aucun prix exploitable trouvé sur ${url}.`);
+        console.log(`⚠️ [Puppeteer] Aucun prix exploitable trouvé sur ${url}.`);
         return null;
 
     } catch (e) {
-        console.log(`ℹ️ [Direct] Erreur sur la fiche produit : ${e.response?.status || ''} ${e.message}`);
+        console.log(`ℹ️ [Puppeteer] Erreur sur la fiche produit : ${e.message}`);
         return null;
+    } finally {
+        if (page) await page.close();
     }
 }
 
 
 
-function calculerVerdict(prixVinted, prixCardmarket) {
+function calculerVerdict(prixVinted, prixCardmarket, language) {
     if (!prixVinted || isNaN(prixVinted)) return null;
     const ratio = prixVinted / prixCardmarket;
     const diffPourcent = Math.round((ratio - 1) * 100);
 
-    if (ratio <= SEUIL_BONNE_AFFAIRE) {
-        return { label: "🔥 Bonne affaire", diffPourcent };
-    } else if (ratio <= SEUIL_PRIX_CORRECT) {
-        return { label: "✅ Prix correct", diffPourcent };
-    } else {
-        return { label: "⚠️ Plus cher que le marché", diffPourcent };
-    }
+    // Nos sources gratuites (TCGdex/scraping direct) ne filtrent pas toujours
+    // fiablement par langue. Pour une carte non-EN, on ne peut pas garantir que
+    // le prix de référence correspond à la bonne langue -> seuils plus prudents
+    // + avertissement explicite plutôt qu'un faux verdict de confiance.
+    const langueIncertaine = Boolean(language) && language !== 'EN';
+    const seuilBonneAffaire = langueIncertaine ? 0.60 : SEUIL_BONNE_AFFAIRE;
+    const seuilPrixCorrect = langueIncertaine ? 1.30 : SEUIL_PRIX_CORRECT;
+
+    let label;
+    if (ratio <= seuilBonneAffaire) label = "🔥 Bonne affaire";
+    else if (ratio <= seuilPrixCorrect) label = "✅ Prix correct";
+    else label = "⚠️ Plus cher que le marché";
+
+    return { label, diffPourcent, langueIncertaine };
 }
 
 // ============================================================
@@ -406,9 +441,13 @@ app.post('/api/analyser', async (req, res) => {
         // 2. Sinon : on essaie d'abord le scraping direct (gratuit, peut donner un prix
         // filtré par langue), puis TCGdex en repli garanti (fiable mais moyenne globale)
         if (!resultat) {
-            const urlDirect = await trouverCarteDirect(cardInfo.name, cardInfo.number, cardInfo.setCode);
-            if (urlDirect) {
-                resultat = await getPrixDirect(urlDirect, cardInfo.language);
+            const trouvaille = await trouverCarteDirect(cardInfo.name, cardInfo.number, cardInfo.setCode);
+            if (trouvaille) {
+                try {
+                    resultat = await getPrixDirect(trouvaille.browser, trouvaille.lien, cardInfo.language);
+                } finally {
+                    await trouvaille.browser.close(); // toujours fermer, même si getPrixDirect échoue
+                }
             }
 
             if (!resultat) {
@@ -428,7 +467,7 @@ app.post('/api/analyser', async (req, res) => {
         }
 
         const prixVintedNombre = vintedPrice ? parseFloat(String(vintedPrice).replace(',', '.')) : null;
-        const verdict = calculerVerdict(prixVintedNombre, resultat.price);
+        const verdict = calculerVerdict(prixVintedNombre, resultat.price, cardInfo.language);
 
         res.json({
             success: true,
@@ -439,7 +478,8 @@ app.post('/api/analyser', async (req, res) => {
             cardmarketUrl: resultat.url,
             vintedPrice: prixVintedNombre,
             verdict: verdict?.label || null,
-            diffPourcent: verdict?.diffPourcent ?? null
+            diffPourcent: verdict?.diffPourcent ?? null,
+            langueIncertaine: verdict?.langueIncertaine || false
         });
 
     } catch (error) {
