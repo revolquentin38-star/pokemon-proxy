@@ -29,6 +29,13 @@ const SEUIL_PRIX_CORRECT  = 1.10; // jusqu'à 10% plus cher -> prix correct
 // "~google/gemini-pro-latest" ici (plus précis, plus cher).
 const MODELE_IA = "google/gemini-2.5-flash";
 
+// Cardmarket est protégé par Cloudflare : un render=true basique se fait souvent
+// bloquer/timeout. ScraperAPI recommande premium=true (proxies résidentiels) pour
+// les domaines protégés. ⚠️ Coûte nettement plus de crédits qu'un render=true simple —
+// vérifie ton quota sur dashboard.scraperapi.com. Mets à false si tu veux économiser.
+const PROXY_PREMIUM = true;
+const PARAM_PREMIUM = PROXY_PREMIUM ? '&premium=true' : '';
+
 // ============================================================
 // MONGODB — connexion + schéma de cache
 // ============================================================
@@ -155,8 +162,7 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
 
 async function essayerRechercheCardmarket(recherche) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(recherche)}`;
-    const waitFor = encodeURIComponent('a[href*="Pokemon/Cards"]');
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true&wait_for_selector=${waitFor}`;
+    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true${PARAM_PREMIUM}`;
 
     try {
         const response = await axios.get(scraperUrl, { timeout: 60000 });
@@ -176,10 +182,6 @@ async function essayerRechercheCardmarket(recherche) {
         return lien;
 
     } catch (e) {
-        // ScraperAPI renvoie souvent une erreur (ex: 500) quand wait_for_selector
-        // n'apparaît jamais dans le délai imparti — typiquement quand la recherche
-        // ne donne vraiment aucun résultat. On traite ça comme "pas trouvé" pour
-        // cette tentative précise, SANS empêcher le repli suivant de s'exécuter.
         console.error(`⚠️ Requête ScraperAPI en échec pour "${recherche}" : ${e.response?.status || ''} ${e.message}`);
         return null;
     }
@@ -187,8 +189,7 @@ async function essayerRechercheCardmarket(recherche) {
 
 async function essayerRechercheParNomSeul(name, number) {
     const urlRecherche = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(name)}`;
-    const waitFor = encodeURIComponent('a[href*="Pokemon/Cards"]');
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true&wait_for_selector=${waitFor}`;
+    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(urlRecherche)}&render=true${PARAM_PREMIUM}`;
 
     try {
         const response = await axios.get(scraperUrl, { timeout: 60000 });
@@ -245,8 +246,7 @@ async function trouverUrlCardmarket(name, number, setCode) {
 // ============================================================
 
 async function getPrixDepuisFiche(url) {
-    const waitFor = encodeURIComponent('dl, .price-container, [data-testid="price"]');
-    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true&wait_for_selector=${waitFor}`;
+    const scraperUrl = `https://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true${PARAM_PREMIUM}`;
 
     try {
         const response = await axios.get(scraperUrl, { timeout: 60000 });
