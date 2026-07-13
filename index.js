@@ -178,7 +178,7 @@ function echapperRegex(texte) {
 
 async function chercherPrixCatalogueLocal(name) {
     try {
-        if (mongoose.connection.readyState !== 1) return null;
+        if (mongoose.connection.readyState !== 1) return { trouvaille: null, ambigu: false };
 
         // Nom exact, éventuellement suivi de " [Attaque1 | Attaque2]"
         const regex = new RegExp(`^${echapperRegex(name)}(\\s*\\[|$)`, 'i');
@@ -186,7 +186,7 @@ async function chercherPrixCatalogueLocal(name) {
 
         if (candidats.length === 0) {
             console.log(`ℹ️ Catalogue local : aucune correspondance pour "${name}".`);
-            return null;
+            return { trouvaille: null, ambigu: false };
         }
 
         const groupes = {};
@@ -194,8 +194,11 @@ async function chercherPrixCatalogueLocal(name) {
         const nombreDeGroupes = Object.keys(groupes).length;
 
         if (nombreDeGroupes > 1) {
-            console.log(`ℹ️ Catalogue local : ${nombreDeGroupes} cartes distinctes possibles pour "${name}" — ambigu, repli sur TCGdex+image.`);
-            return null;
+            // Le catalogue local n'a pas le numéro de collection par carte, donc un nom
+            // très réimprimé (ex: "Mewtwo ex") remonte toutes ses éditions -> ambiguïté
+            // qu'une recherche directe (même numéro) ne résoudra pas différemment.
+            console.log(`ℹ️ Catalogue local : ${nombreDeGroupes} cartes distinctes possibles pour "${name}" — ambigu, inutile d'essayer la recherche directe, repli direct sur TCGdex+image.`);
+            return { trouvaille: null, ambigu: true };
         }
 
         const idsProducts = candidats.map(c => c.idProduct);
@@ -203,7 +206,7 @@ async function chercherPrixCatalogueLocal(name) {
 
         if (guides.length === 0) {
             console.log(`ℹ️ Catalogue local : "${name}" trouvé (idMetacard unique) mais aucun prix dans le guide local.`);
-            return null;
+            return { trouvaille: null, ambigu: false };
         }
 
         const prixMoyen = guides.reduce((s, g) => s + g.trend, 0) / guides.length;
@@ -212,14 +215,17 @@ async function chercherPrixCatalogueLocal(name) {
         console.log(`✅ Catalogue local : "${name}" -> idProduct ${idProductRetenu}, prix ${prixMoyen.toFixed(2)} € (moyenne sur ${guides.length} réimpression(s))`);
 
         return {
-            price: parseFloat(prixMoyen.toFixed(2)),
-            idProduct: idProductRetenu,
-            url: `https://www.cardmarket.com/en/Pokemon/Products/Singles?idProduct=${idProductRetenu}`
+            trouvaille: {
+                price: parseFloat(prixMoyen.toFixed(2)),
+                idProduct: idProductRetenu,
+                url: `https://www.cardmarket.com/en/Pokemon/Products/Singles?idProduct=${idProductRetenu}`
+            },
+            ambigu: false
         };
 
     } catch (e) {
         console.error(`❌ Erreur catalogue local pour "${name}" :`, e.message);
-        return null;
+        return { trouvaille: null, ambigu: false };
     }
 }
 
@@ -641,10 +647,10 @@ app.post('/api/analyser', async (req, res) => {
         if (debug) console.log("🐛 Mode debug : lecture du cache sautée.");
 
         // 2. Sinon, dans l'ordre : catalogue local (instantané) -> scraping direct
-        // par recherche -> TCGdex+image (repli garanti)
+        // par recherche (sauté si déjà ambigu) -> TCGdex+image (repli garanti)
         if (!resultat) {
             // 2a. Catalogue local importé (gratuit, aucun appel réseau)
-            const trouvailleLocale = await chercherPrixCatalogueLocal(cardInfo.name);
+            const { trouvaille: trouvailleLocale, ambigu: ambiguLocal } = await chercherPrixCatalogueLocal(cardInfo.name);
 
             if (trouvailleLocale) {
                 resultat = { price: trouvailleLocale.price, url: trouvailleLocale.url };
@@ -660,8 +666,10 @@ app.post('/api/analyser', async (req, res) => {
                 }
             }
 
-            // 2b. Scraping direct par recherche (si le catalogue local n'a pas suffi)
-            if (!resultat) {
+            // 2b. Scraping direct par recherche — sauté si le catalogue local a déjà
+            // détecté une ambiguïté (une recherche par nom+numéro ne la résoudra pas
+            // différemment, ça ne ferait que perdre 30-40s pour rien)
+            if (!resultat && !ambiguLocal) {
                 const trouvaille = await trouverCarteDirect(cardInfo.name, cardInfo.number, cardInfo.setCode);
                 if (trouvaille) {
                     try {
@@ -670,6 +678,8 @@ app.post('/api/analyser', async (req, res) => {
                         await trouvaille.browser.close(); // toujours fermer, même si getPrixDirect échoue
                     }
                 }
+            } else if (ambiguLocal) {
+                console.log("⏭️ Recherche directe sautée (ambiguïté déjà détectée localement).");
             }
 
             // 2c. TCGdex + comparaison d'image (repli garanti)
