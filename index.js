@@ -320,23 +320,27 @@ async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted) {
         if (resultats.length > 1) {
             console.log(`ℹ️ TCGdex : ${resultats.length} résultats pour "${name}" #${number} :`, resultats.map(r => r.id));
 
-            // 1er départage : le code du set détecté par l'IA
-            const correspondance = setCode ? resultats.find(r => r.id.toLowerCase().includes(setCode.toLowerCase())) : null;
+            // 1er départage : comparaison visuelle avec la photo Vinted (comme PokéCardex/
+            // les vraies apps de scan) — l'illustration est plus fiable que le texte pour
+            // distinguer deux cartes qui partagent le même nom et le même numéro.
+            console.log(`ℹ️ Tentative de départage par image...`);
+            const resultatImage = await departagerParImage(imageUrlVinted, resultats);
 
-            if (correspondance) {
-                choisi = correspondance;
+            if (resultatImage?.confiant) {
+                choisi = resultatImage.candidat;
             } else {
-                // 2e départage : comparaison visuelle avec la photo Vinted (comme PokéCardex)
-                console.log(`ℹ️ Aucune correspondance de set, tentative de départage par image...`);
-                const resultatImage = await departagerParImage(imageUrlVinted, resultats);
+                // 2e départage (filet de sécurité) : le code du set détecté par l'IA,
+                // seulement si l'image n'a pas donné un résultat assez net (photo floue,
+                // image de référence introuvable, etc.)
+                const correspondance = setCode ? resultats.find(r => r.id.toLowerCase().includes(setCode.toLowerCase())) : null;
 
-                if (resultatImage?.confiant) {
-                    choisi = resultatImage.candidat;
+                if (correspondance) {
+                    choisi = correspondance;
+                    console.log(`ℹ️ Image non concluante, départage par set "${setCode}" à la place.`);
                 } else {
-                    // Toujours utile même si pas "confiant" : au moins un choix informé plutôt qu'au hasard
-                    if (resultatImage) choisi = resultatImage.candidat;
+                    if (resultatImage) choisi = resultatImage.candidat; // meilleur choix informé plutôt qu'au hasard
                     ambigu = true;
-                    console.log(`⚠️ ${resultats.length} impressions possibles pour "${name}" #${number}, résultat incertain même après comparaison d'image.`);
+                    console.log(`⚠️ ${resultats.length} impressions possibles pour "${name}" #${number}, résultat incertain même après image + set.`);
                 }
             }
         }
