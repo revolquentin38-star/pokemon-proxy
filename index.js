@@ -627,6 +627,60 @@ async function getPrixDirectParId(idProduct, language, maxEssais = 3) {
     return null;
 }
 
+// Récupère les noms d'attaques + talents d'une carte TCGdex (pour croiser avec
+// les noms entre crochets du catalogue Cardmarket).
+async function getAttaquesTCGdex(cardId) {
+    try {
+        const url = `https://api.tcgdex.net/v2/en/cards/${encodeURIComponent(cardId)}`;
+        const response = await axios.get(url, { timeout: 15000 });
+        const data = response.data || {};
+        const noms = [];
+        if (Array.isArray(data.attacks)) noms.push(...data.attacks.map(a => a.name).filter(Boolean));
+        if (Array.isArray(data.abilities)) noms.push(...data.abilities.map(a => a.name).filter(Boolean));
+        return noms.map(n => n.toLowerCase().trim());
+    } catch (e) {
+        console.log(`ℹ️ Impossible de récupérer les attaques TCGdex pour "${cardId}" : ${e.message}`);
+        return [];
+    }
+}
+
+// Parmi plusieurs idProduct candidats du catalogue local, trouve celui dont les
+// attaques entre crochets correspondent le mieux aux attaques TCGdex. C'est ce
+// qui permet de distinguer LE bon Charizard TG03 parmi les 79 Charizard.
+async function trouverIdProductParAttaques(nomExact, attaquesTCGdex) {
+    try {
+        if (mongoose.connection.readyState !== 1 || attaquesTCGdex.length === 0) return null;
+
+        const regex = new RegExp(`^${echapperRegex(nomExact)}\\s*\\[`, 'i');
+        const candidats = await CatalogueProduit.find({ name: regex }).lean();
+        if (candidats.length === 0) return null;
+
+        let meilleur = null;
+        let meilleurScore = 0;
+
+        for (const c of candidats) {
+            // Extraire le contenu entre crochets : "Charizard [Battle Sense | Royal Blaze]"
+            const match = c.name.match(/\[([^\]]+)\]/);
+            if (!match) continue;
+            const attaquesCatalogue = match[1].split('|').map(s => s.toLowerCase().trim());
+
+            // Score = nombre d'attaques TCGdex retrouvées dans le nom catalogue
+            const score = attaquesTCGdex.filter(a => attaquesCatalogue.some(ac => ac.includes(a) || a.includes(ac))).length;
+            if (score > meilleurScore) { meilleurScore = score; meilleur = c; }
+        }
+
+        // On exige qu'au moins une attaque corresponde pour être sûr
+        if (meilleur && meilleurScore > 0) {
+            console.log(`🎯 idProduct ${meilleur.idProduct} identifié par attaques (${meilleurScore} correspondance(s)) : "${meilleur.name}"`);
+            return meilleur.idProduct;
+        }
+        return null;
+    } catch (e) {
+        console.log(`ℹ️ Erreur croisement par attaques : ${e.message}`);
+        return null;
+    }
+}
+
 // Retrouve le(s) idProduct dans le catalogue local pour un nom de carte donné.
 // Sert d'annuaire nom -> idProduct pour ensuite scraper le prix live Cardmarket.
 // Comme le catalogue n'a pas le numéro, on peut avoir plusieurs candidats ;
@@ -706,18 +760,26 @@ app.post('/api/analyser', async (req, res) => {
             const idsProducts = await trouverIdProductLocal(trouvailleTCGdex.nomExact);
             console.log(`🗂️ Catalogue local : ${idsProducts.length} idProduct(s) pour "${trouvailleTCGdex.nomExact}".`);
 
-            // 2c. Prix LIVE Cardmarket. Si un seul idProduct candidat -> on le vise direct.
-            // Si plusieurs (réimpressions), on ne peut pas trancher lequel sans le numéro,
-            // donc on ne tente le live que si c'est non ambigu (un seul idProduct).
+            // Si plusieurs candidats, on lève l'ambiguïté en croisant les attaques de la
+            // carte (TCGdex) avec les noms entre crochets du catalogue Cardmarket.
+            let idProductCible = null;
             if (idsProducts.length === 1) {
-                const live = await getPrixDirectParId(idsProducts[0], cardInfo.language);
+                idProductCible = idsProducts[0];
+            } else if (idsProducts.length > 1) {
+                const attaques = await getAttaquesTCGdex(trouvailleTCGdex.id);
+                idProductCible = await trouverIdProductParAttaques(trouvailleTCGdex.nomExact, attaques);
+                if (!idProductCible) {
+                    console.log(`ℹ️ Attaques non concluantes pour départager les ${idsProducts.length} idProduct — repli sur prix TCGdex.`);
+                }
+            }
+
+            // 2c. Prix LIVE Cardmarket sur l'idProduct identifié
+            if (idProductCible) {
+                const live = await getPrixDirectParId(idProductCible, cardInfo.language);
                 if (live) {
                     console.log(`💚 Prix LIVE Cardmarket obtenu (filtré par ${live.filtrePar}).`);
                     resultat = live;
-                    // Le live n'est pas "incertain" côté carte : un seul idProduct = pas d'ambiguïté
                 }
-            } else if (idsProducts.length > 1) {
-                console.log(`ℹ️ Plusieurs idProduct pour "${trouvailleTCGdex.nomExact}" — impossible de viser le bon en live sans plus d'info, repli sur prix TCGdex.`);
             }
 
             // 2d. Repli : prix TCGdex (frais du jour) si le live n'a rien donné
