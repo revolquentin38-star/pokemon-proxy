@@ -53,6 +53,20 @@ cardPriceSchema.index({ name: 1, number: 1, language: 1 }, { unique: true });
 
 const CardPrice = mongoose.model('CardPrice', cardPriceSchema);
 
+// Catalogue produits Cardmarket (importé via import-catalogue.js)
+const catalogueProduitSchema = new mongoose.Schema({
+    idProduct: Number, name: String, idExpansion: Number, idMetacard: Number
+});
+const CatalogueProduit = mongoose.model('CatalogueProduit', catalogueProduitSchema, 'catalogue_produits');
+
+// Guide des prix Cardmarket (importé via import-price-guide.js)
+const guidePrixSchema = new mongoose.Schema({
+    idProduct: Number, avg: Number, low: Number, trend: Number,
+    avg1: Number, avg7: Number, avg30: Number,
+    avgHolo: Number, lowHolo: Number, trendHolo: Number
+});
+const GuidePrix = mongoose.model('GuidePrix', guidePrixSchema, 'guide_prix');
+
 function cleKey(name, number, language) {
     return {
         name: String(name).trim().toLowerCase(),
@@ -150,8 +164,70 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
 }
 
 // ============================================================
-// ÉTAPE 2 — Trouver la carte et son prix via l'API TCGdex (gratuite, sans clé)
-// Docs : https://tcgdex.dev/markets-prices — prix Cardmarket inclus directement.
+// ÉTAPE 1bis — Catalogue LOCAL (importé depuis les exports officiels Cardmarket)
+// Gratuit, instantané, aucun appel réseau. On regroupe par idMetacard : si un
+// seul "idMetacard" correspond au nom, toutes les entrées sont la même carte
+// (juste des réimpressions) -> pas d'ambiguïté, prix directement fiable.
+// Si plusieurs idMetacard correspondent, c'est une vraie ambiguïté qu'on ne
+// peut pas trancher sans image -> on laisse la main à TCGdex+comparaison photo.
+// ============================================================
+
+function echapperRegex(texte) {
+    return texte.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function chercherPrixCatalogueLocal(name) {
+    try {
+        if (mongoose.connection.readyState !== 1) return null;
+
+        // Nom exact, éventuellement suivi de " [Attaque1 | Attaque2]"
+        const regex = new RegExp(`^${echapperRegex(name)}(\\s*\\[|$)`, 'i');
+        const candidats = await CatalogueProduit.find({ name: regex }).lean();
+
+        if (candidats.length === 0) {
+            console.log(`ℹ️ Catalogue local : aucune correspondance pour "${name}".`);
+            return null;
+        }
+
+        const groupes = {};
+        for (const c of candidats) (groupes[c.idMetacard] ||= []).push(c);
+        const nombreDeGroupes = Object.keys(groupes).length;
+
+        if (nombreDeGroupes > 1) {
+            console.log(`ℹ️ Catalogue local : ${nombreDeGroupes} cartes distinctes possibles pour "${name}" — ambigu, repli sur TCGdex+image.`);
+            return null;
+        }
+
+        const idsProducts = candidats.map(c => c.idProduct);
+        const guides = await GuidePrix.find({ idProduct: { $in: idsProducts }, trend: { $ne: null } }).lean();
+
+        if (guides.length === 0) {
+            console.log(`ℹ️ Catalogue local : "${name}" trouvé (idMetacard unique) mais aucun prix dans le guide local.`);
+            return null;
+        }
+
+        const prixMoyen = guides.reduce((s, g) => s + g.trend, 0) / guides.length;
+        const idProductRetenu = guides[0].idProduct;
+
+        console.log(`✅ Catalogue local : "${name}" -> idProduct ${idProductRetenu}, prix ${prixMoyen.toFixed(2)} € (moyenne sur ${guides.length} réimpression(s))`);
+
+        return {
+            price: parseFloat(prixMoyen.toFixed(2)),
+            idProduct: idProductRetenu,
+            url: `https://www.cardmarket.com/en/Pokemon/Products/Singles?idProduct=${idProductRetenu}`
+        };
+
+    } catch (e) {
+        console.error(`❌ Erreur catalogue local pour "${name}" :`, e.message);
+        return null;
+    }
+}
+
+
+
+// ============================================================
+// ÉTAPE 2 — Si ambigu localement : TCGdex (gratuit, sans clé) + comparaison
+// d'image. Docs : https://tcgdex.dev/markets-prices
 // ============================================================
 
 const Jimp = require('jimp');
@@ -494,6 +570,26 @@ async function getPrixDirect(browser, url, language) {
 
 
 
+// Comme getPrixDirect, mais part directement d'un idProduct connu (catalogue
+// local) au lieu de chercher — plus rapide, moins de surface d'échec avec Cloudflare.
+async function getPrixDirectParId(idProduct, language) {
+    const url = `https://www.cardmarket.com/en/Pokemon/Products/Singles?idProduct=${idProduct}`;
+    let browser;
+    try {
+        browser = await puppeteer.launch({
+            headless: 'new',
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+        });
+        await pauseAleatoire(500, 1500);
+        return await getPrixDirect(browser, url, language);
+    } catch (e) {
+        console.log(`ℹ️ [Puppeteer/idProduct] Erreur : ${e.message}`);
+        return null;
+    } finally {
+        if (browser) await browser.close();
+    }
+}
+
 function calculerVerdict(prixVinted, prixCardmarket, language, carteIncertaine) {
     if (!prixVinted || isNaN(prixVinted)) return null;
     const ratio = prixVinted / prixCardmarket;
@@ -540,23 +636,44 @@ app.post('/api/analyser', async (req, res) => {
         let resultat = debug ? null : await lireCache(cardInfo.name, cardInfo.number, cardInfo.language);
         if (debug) console.log("🐛 Mode debug : lecture du cache sautée.");
 
-        // 2. Sinon : on essaie d'abord le scraping direct (gratuit, peut donner un prix
-        // filtré par langue), puis TCGdex en repli garanti (fiable mais moyenne globale)
+        // 2. Sinon, dans l'ordre : catalogue local (instantané) -> scraping direct
+        // par recherche -> TCGdex+image (repli garanti)
         if (!resultat) {
-            const trouvaille = await trouverCarteDirect(cardInfo.name, cardInfo.number, cardInfo.setCode);
-            if (trouvaille) {
-                try {
-                    resultat = await getPrixDirect(trouvaille.browser, trouvaille.lien, cardInfo.language);
-                } finally {
-                    await trouvaille.browser.close(); // toujours fermer, même si getPrixDirect échoue
+            // 2a. Catalogue local importé (gratuit, aucun appel réseau)
+            const trouvailleLocale = await chercherPrixCatalogueLocal(cardInfo.name);
+
+            if (trouvailleLocale) {
+                resultat = { price: trouvailleLocale.price, url: trouvailleLocale.url };
+
+                // Carte non-EN trouvée localement : on tente un affinage par langue
+                // directement sur la fiche connue (idProduct), sans recherche.
+                if (cardInfo.language && cardInfo.language !== 'EN') {
+                    const affinage = await getPrixDirectParId(trouvailleLocale.idProduct, cardInfo.language);
+                    if (affinage?.filtrePar === 'langue') {
+                        console.log(`🌐 Affinage par langue réussi sur idProduct ${trouvailleLocale.idProduct}.`);
+                        resultat = affinage;
+                    }
                 }
             }
 
+            // 2b. Scraping direct par recherche (si le catalogue local n'a pas suffi)
             if (!resultat) {
-                console.log("↪️ Repli sur TCGdex (scraping direct indisponible ou bloqué).");
+                const trouvaille = await trouverCarteDirect(cardInfo.name, cardInfo.number, cardInfo.setCode);
+                if (trouvaille) {
+                    try {
+                        resultat = await getPrixDirect(trouvaille.browser, trouvaille.lien, cardInfo.language);
+                    } finally {
+                        await trouvaille.browser.close(); // toujours fermer, même si getPrixDirect échoue
+                    }
+                }
+            }
+
+            // 2c. TCGdex + comparaison d'image (repli garanti)
+            if (!resultat) {
+                console.log("↪️ Repli sur TCGdex (catalogue local et scraping direct indisponibles).");
                 const trouvailleTCGdex = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, imageUrl);
                 if (!trouvailleTCGdex) {
-                    return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée (ni en direct, ni sur TCGdex)` });
+                    return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée (catalogue local, direct, ni TCGdex)` });
                 }
                 resultat = await getPrixDepuisTCGdex(trouvailleTCGdex.id, cardInfo.name, cardInfo.number);
                 if (resultat && trouvailleTCGdex.ambigu) resultat.carteIncertaine = true;
