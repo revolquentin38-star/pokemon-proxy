@@ -246,19 +246,22 @@ async function chercherPrixCatalogueLocal(name) {
 // d'image. Docs : https://tcgdex.dev/markets-prices
 // ============================================================
 
-const Jimp = require('jimp');
+const { Jimp } = require('jimp');
 
 // Hash perceptif simple (difference hash 8x8 = 64 bits) — permet de comparer
 // deux images visuellement sans dépendance native (contrairement à sharp),
 // pour ne pas revivre le calvaire d'installation qu'on a eu avec Puppeteer/Chrome.
 async function calculerHashImage(urlImage) {
     const image = await Jimp.read(urlImage);
-    image.resize(9, 8).greyscale();
+    image.resize({ w: 9, h: 8 }).greyscale(); // Jimp v1 : resize prend un objet {w, h}
     let hash = '';
     for (let y = 0; y < 8; y++) {
         for (let x = 0; x < 8; x++) {
-            const gauche = Jimp.intToRGBA(image.getPixelColor(x, y)).r;
-            const droite = Jimp.intToRGBA(image.getPixelColor(x + 1, y)).r;
+            // Jimp v1 : on lit directement le canal rouge dans le bitmap
+            const idxGauche = (image.bitmap.width * y + x) * 4;
+            const idxDroite = (image.bitmap.width * y + (x + 1)) * 4;
+            const gauche = image.bitmap.data[idxGauche];
+            const droite = image.bitmap.data[idxDroite];
             hash += gauche > droite ? '1' : '0';
         }
     }
