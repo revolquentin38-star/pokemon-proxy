@@ -201,7 +201,17 @@ async function chercherPrixCatalogueLocal(name) {
             return { trouvaille: null, ambigu: true };
         }
 
+        // Un seul idMetacard, MAIS avec beaucoup de réimpressions (ex: cartes promo très
+        // rééditées comme "Iono") -> des produits différents avec des valeurs très
+        // différentes (promo vs ETB vs deck thème). Une moyenne aveugle serait fausse —
+        // on préfère laisser TCGdex+comparaison d'image identifier le produit précis.
         const idsProducts = candidats.map(c => c.idProduct);
+        const SEUIL_REIMPRESSIONS_FIABLE = 5;
+        if (idsProducts.length > SEUIL_REIMPRESSIONS_FIABLE) {
+            console.log(`ℹ️ Catalogue local : "${name}" a ${idsProducts.length} réimpressions sous le même idMetacard — trop pour une moyenne fiable, repli sur TCGdex+image.`);
+            return { trouvaille: null, ambigu: true };
+        }
+
         const guides = await GuidePrix.find({ idProduct: { $in: idsProducts }, trend: { $ne: null } }).lean();
 
         if (guides.length === 0) {
@@ -352,7 +362,7 @@ async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted) {
         }
 
         console.log(`🔗 Carte TCGdex retenue : ${choisi.id} ("${choisi.name}")${ambigu ? ' [INCERTAIN]' : ''}`);
-        return { id: choisi.id, ambigu };
+        return { id: choisi.id, ambigu, nomExact: choisi.name, localId: choisi.localId || number };
 
     } catch (e) {
         console.error(`❌ Erreur recherche TCGdex pour "${name}" #${number} :`, e.response?.status, e.message);
@@ -582,21 +592,54 @@ async function getPrixDirect(browser, url, language) {
 
 // Comme getPrixDirect, mais part directement d'un idProduct connu (catalogue
 // local) au lieu de chercher — plus rapide, moins de surface d'échec avec Cloudflare.
-async function getPrixDirectParId(idProduct, language) {
+async function getPrixDirectParId(idProduct, language, maxEssais = 3) {
     const url = `https://www.cardmarket.com/en/Pokemon/Products/Singles?idProduct=${idProduct}`;
-    let browser;
+
+    // Le blocage Cloudflare étant aléatoire (parfois ça passe, parfois non), on
+    // réessaie plusieurs fois avec une pause croissante entre chaque tentative.
+    // Un nouveau navigateur à chaque essai = nouvelle "session" propre.
+    for (let essai = 1; essai <= maxEssais; essai++) {
+        let browser;
+        try {
+            browser = await puppeteer.launch({
+                headless: 'new',
+                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+            });
+            await pauseAleatoire(500, 1500);
+            const resultat = await getPrixDirect(browser, url, language);
+
+            if (resultat) {
+                if (essai > 1) console.log(`✅ [Puppeteer/idProduct] Réussite à l'essai ${essai}/${maxEssais}.`);
+                return resultat;
+            }
+            console.log(`⏳ [Puppeteer/idProduct] Essai ${essai}/${maxEssais} sans résultat (bloqué ou vide).`);
+        } catch (e) {
+            console.log(`ℹ️ [Puppeteer/idProduct] Erreur essai ${essai}/${maxEssais} : ${e.message}`);
+        } finally {
+            if (browser) await browser.close();
+        }
+
+        // Pause croissante avant le prochain essai (1.5s, puis 3s, puis 4.5s...)
+        if (essai < maxEssais) await pauseAleatoire(1500 * essai, 1500 * essai + 1500);
+    }
+
+    console.log(`🚫 [Puppeteer/idProduct] Échec après ${maxEssais} essais pour idProduct ${idProduct}.`);
+    return null;
+}
+
+// Retrouve le(s) idProduct dans le catalogue local pour un nom de carte donné.
+// Sert d'annuaire nom -> idProduct pour ensuite scraper le prix live Cardmarket.
+// Comme le catalogue n'a pas le numéro, on peut avoir plusieurs candidats ;
+// on les renvoie tous, l'appelant tranchera (image déjà faite en amont).
+async function trouverIdProductLocal(nomExact) {
     try {
-        browser = await puppeteer.launch({
-            headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
-        });
-        await pauseAleatoire(500, 1500);
-        return await getPrixDirect(browser, url, language);
+        if (mongoose.connection.readyState !== 1) return [];
+        const regex = new RegExp(`^${echapperRegex(nomExact)}(\\s*\\[|$)`, 'i');
+        const candidats = await CatalogueProduit.find({ name: regex }).lean();
+        return candidats.map(c => c.idProduct);
     } catch (e) {
-        console.log(`ℹ️ [Puppeteer/idProduct] Erreur : ${e.message}`);
-        return null;
-    } finally {
-        if (browser) await browser.close();
+        console.error(`❌ Erreur trouverIdProductLocal pour "${nomExact}" :`, e.message);
+        return [];
     }
 }
 
@@ -646,55 +689,52 @@ app.post('/api/analyser', async (req, res) => {
         let resultat = debug ? null : await lireCache(cardInfo.name, cardInfo.number, cardInfo.language);
         if (debug) console.log("🐛 Mode debug : lecture du cache sautée.");
 
-        // 2. Sinon, dans l'ordre : catalogue local (instantané) -> scraping direct
-        // par recherche (sauté si déjà ambigu) -> TCGdex+image (repli garanti)
+        // 2. Flux orienté JUSTESSE :
+        //    a) identifier le produit exact (TCGdex : numéro + comparaison d'image)
+        //    b) retrouver son idProduct dans le catalogue local
+        //    c) prix LIVE Cardmarket sur cet idProduct (le plus juste, filtré par langue)
+        //    d) repli sur le prix TCGdex (frais du jour) si Cloudflare bloque
         if (!resultat) {
-            // 2a. Catalogue local importé (gratuit, aucun appel réseau)
-            const { trouvaille: trouvailleLocale, ambigu: ambiguLocal } = await chercherPrixCatalogueLocal(cardInfo.name);
+            // 2a. Identification précise via TCGdex + image
+            const trouvailleTCGdex = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, imageUrl);
 
-            if (trouvailleLocale) {
-                resultat = { price: trouvailleLocale.price, url: trouvailleLocale.url };
-
-                // Carte non-EN trouvée localement : on tente un affinage par langue
-                // directement sur la fiche connue (idProduct), sans recherche.
-                if (cardInfo.language && cardInfo.language !== 'EN') {
-                    const affinage = await getPrixDirectParId(trouvailleLocale.idProduct, cardInfo.language);
-                    if (affinage?.filtrePar === 'langue') {
-                        console.log(`🌐 Affinage par langue réussi sur idProduct ${trouvailleLocale.idProduct}.`);
-                        resultat = affinage;
-                    }
-                }
+            if (!trouvailleTCGdex) {
+                return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée sur TCGdex` });
             }
 
-            // 2b. Scraping direct par recherche — sauté si le catalogue local a déjà
-            // détecté une ambiguïté (une recherche par nom+numéro ne la résoudra pas
-            // différemment, ça ne ferait que perdre 30-40s pour rien)
-            if (!resultat && !ambiguLocal) {
-                const trouvaille = await trouverCarteDirect(cardInfo.name, cardInfo.number, cardInfo.setCode);
-                if (trouvaille) {
-                    try {
-                        resultat = await getPrixDirect(trouvaille.browser, trouvaille.lien, cardInfo.language);
-                    } finally {
-                        await trouvaille.browser.close(); // toujours fermer, même si getPrixDirect échoue
-                    }
+            // 2b. Retrouver l'idProduct Cardmarket via le catalogue local (annuaire nom -> idProduct)
+            const idsProducts = await trouverIdProductLocal(trouvailleTCGdex.nomExact);
+            console.log(`🗂️ Catalogue local : ${idsProducts.length} idProduct(s) pour "${trouvailleTCGdex.nomExact}".`);
+
+            // 2c. Prix LIVE Cardmarket. Si un seul idProduct candidat -> on le vise direct.
+            // Si plusieurs (réimpressions), on ne peut pas trancher lequel sans le numéro,
+            // donc on ne tente le live que si c'est non ambigu (un seul idProduct).
+            if (idsProducts.length === 1) {
+                const live = await getPrixDirectParId(idsProducts[0], cardInfo.language);
+                if (live) {
+                    console.log(`💚 Prix LIVE Cardmarket obtenu (filtré par ${live.filtrePar}).`);
+                    resultat = live;
+                    // Le live n'est pas "incertain" côté carte : un seul idProduct = pas d'ambiguïté
                 }
-            } else if (ambiguLocal) {
-                console.log("⏭️ Recherche directe sautée (ambiguïté déjà détectée localement).");
+            } else if (idsProducts.length > 1) {
+                console.log(`ℹ️ Plusieurs idProduct pour "${trouvailleTCGdex.nomExact}" — impossible de viser le bon en live sans plus d'info, repli sur prix TCGdex.`);
             }
 
-            // 2c. TCGdex + comparaison d'image (repli garanti)
+            // 2d. Repli : prix TCGdex (frais du jour) si le live n'a rien donné
             if (!resultat) {
-                console.log("↪️ Repli sur TCGdex (catalogue local et scraping direct indisponibles).");
-                const trouvailleTCGdex = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, imageUrl);
-                if (!trouvailleTCGdex) {
-                    return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée (catalogue local, direct, ni TCGdex)` });
-                }
+                if (idsProducts.length === 1) console.log("↪️ Live Cardmarket bloqué, repli sur prix TCGdex.");
                 resultat = await getPrixDepuisTCGdex(trouvailleTCGdex.id, cardInfo.name, cardInfo.number);
-                if (resultat && trouvailleTCGdex.ambigu) resultat.carteIncertaine = true;
+                if (resultat) {
+                    resultat.source = 'tcgdex';
+                    if (trouvailleTCGdex.ambigu) resultat.carteIncertaine = true;
+                }
+            } else {
+                resultat.source = 'cardmarket-live';
+                if (trouvailleTCGdex.ambigu) resultat.carteIncertaine = true;
             }
 
             if (!resultat) {
-                return res.json({ success: false, error: "Carte trouvée mais aucun prix disponible (voir logs Render)" });
+                return res.json({ success: false, error: "Carte identifiée mais aucun prix disponible (voir logs Render)" });
             }
 
             // On ne met pas en cache un résultat incertain (carte potentiellement fausse) —
@@ -718,7 +758,8 @@ app.post('/api/analyser', async (req, res) => {
             verdict: verdict?.label || null,
             diffPourcent: verdict?.diffPourcent ?? null,
             langueIncertaine: verdict?.langueIncertaine || false,
-            carteIncertaine: Boolean(resultat.carteIncertaine)
+            carteIncertaine: Boolean(resultat.carteIncertaine),
+            source: resultat.source || 'inconnue'
         });
 
     } catch (error) {
