@@ -3,7 +3,21 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
-const { scraperFiche, fermerBrowser } = require('./live-cardmarket');
+
+// Le module live (Puppeteer) n'est utilisé QUE par l'ancienne architecture, où le
+// serveur tournait sur ton PC. En déploiement (Render), Puppeteer n'est pas
+// installé — et c'est voulu : le prix live est désormais récupéré par l'EXTENSION,
+// depuis le navigateur de l'utilisateur. On charge donc ce module sans exiger
+// qu'il soit présent.
+let scraperFiche = null;
+let fermerBrowser = null;
+try {
+    ({ scraperFiche, fermerBrowser } = require('./live-cardmarket'));
+    console.log("🧩 Module live chargé (Puppeteer disponible).");
+} catch (e) {
+    console.log("ℹ️ Module live non chargé — normal en déploiement : le prix live est fait par l'extension.");
+}
+
 const { choisirMeilleur } = require('./scoring');
 
 const app = express();
@@ -1010,7 +1024,7 @@ app.post('/api/analyser', verifierJeton, async (req, res) => {
             let trouve = false;
             let dernierResultatDouteux = null;
 
-            if (LIVE_ACTIF && classement.length > 0) {
+            if (LIVE_ACTIF && scraperFiche && classement.length > 0) {
                 const nbEssais = Math.min(MAX_ESSAIS_LIVE, classement.length);
                 for (let i = 0; i < nbEssais; i++) {
                     const produitCible = classement[i].candidat;
@@ -1317,6 +1331,6 @@ app.listen(PORT, () => console.log(`🚀 Serveur actif sur le port ${PORT}`));
 // Fermeture propre du navigateur Puppeteer quand on arrête le serveur (Ctrl+C)
 process.on('SIGINT', async () => {
     console.log("\nArrêt du serveur, fermeture du navigateur live...");
-    try { await fermerBrowser(); } catch (e) {}
+    try { if (fermerBrowser) await fermerBrowser(); } catch (e) {}
     process.exit(0);
 });
