@@ -1304,6 +1304,12 @@ app.post('/api/apprendre', verifierJeton, async (req, res) => {
     }
 });
 
+// Route de réveil : l'extension l'appelle dès qu'une page Vinted se charge, pour
+// que le serveur (endormi sur le plan gratuit Render après 15 min d'inactivité)
+// soit déjà chaud quand l'utilisateur clique sur "Analyser". Volontairement
+// minimale : aucun accès base, aucun calcul.
+app.get('/ping', (req, res) => res.json({ ok: true, mongo: mongoose.connection.readyState === 1 }));
+
 app.get('/', (req, res) => res.send('Serveur Analyseur Pokémon actif'));
 
 app.listen(PORT, () => console.log(`🚀 Serveur actif sur le port ${PORT}`));
