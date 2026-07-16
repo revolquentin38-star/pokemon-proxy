@@ -49,9 +49,12 @@ function scorerCandidat(candidat, lu) {
     } else detail.numero = '0 (numéro manquant)';
 
     // 2. SET : le candidat est-il dans l'expansion attendue ?
-    if (lu.idExpansionAttendu != null && candidat.idExpansion != null) {
-        if (candidat.idExpansion === lu.idExpansionAttendu) { score += POIDS.set; detail.set = `+${POIDS.set} (bon set)`; }
-        else detail.set = `0 (exp ${candidat.idExpansion} ≠ ${lu.idExpansionAttendu})`;
+    //    On accepte une LISTE : un set TCGdex peut correspondre à plusieurs
+    //    expansions Cardmarket (édition internationale, japonaise, suppléments).
+    const attendues = lu.idExpansionsAttendues || (lu.idExpansionAttendu != null ? [lu.idExpansionAttendu] : []);
+    if (attendues.length && candidat.idExpansion != null) {
+        if (attendues.includes(candidat.idExpansion)) { score += POIDS.set; detail.set = `+${POIDS.set} (bon set)`; }
+        else { detail.set = `0 (exp ${candidat.idExpansion} hors du set attendu)`; }
     } else detail.set = '0 (set non déterminé)';
 
     // 3. IMAGE : plus la distance de hash est faible, plus le bonus est élevé

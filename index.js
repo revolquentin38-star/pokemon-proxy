@@ -835,7 +835,7 @@ async function getPrixGuideLocal(idProduct) {
 // Enrichit les candidats (prix local + hash image S3) puis les score.
 // NIVEAU 1 : 100% local, aucune requête Cardmarket, aucun risque de ban.
 // ============================================================
-async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted) {
+async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted, idExpansionsAttendues = []) {
     // Hash de la photo Vinted (une seule fois)
     let hashVinted = null;
     if (imageUrlVinted) {
@@ -881,9 +881,13 @@ async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted) {
         candidatsEnrichis.push(enrichi);
     }
 
+    if (idExpansionsAttendues.length) {
+        console.log(`🎯 Set attendu -> expansion(s) Cardmarket : ${idExpansionsAttendues.join(', ')}`);
+    }
+
     const lu = {
         numero: cardInfo.number || null,   // le numéro lu par l'IA (ex: 79, TG06)
-        idExpansionAttendu: null,
+        idExpansionsAttendues,             // déduites du set TCGdex via le pré-remplissage
         rareteElevee: cardInfo.rareteElevee,
         regionAttendue: regionCible
     };
@@ -943,6 +947,25 @@ function pireEtat(a, b) {
     if (ia === -1) return ib === -1 ? null : ORDRE_ETATS[ib];
     if (ib === -1) return ORDRE_ETATS[ia];
     return ORDRE_ETATS[Math.max(ia, ib)]; // index le plus grand = état le plus dégradé
+}
+
+// Retrouve les idExpansion Cardmarket correspondant à un set TCGdex.
+// C'est le "pont" qui manquait : le pré-remplissage TCGdex a stocké, pour chaque
+// carte, le set d'où venait son numéro (champ setTcgdex). En interrogeant cette
+// trace, on sait enfin dans quelle(s) expansion(s) Cardmarket chercher — ce qui
+// active le critère "set" du scoring (40 points), jusqu'ici toujours inutilisé.
+async function expansionsDuSetTCGdex(tcgdexCardId) {
+    try {
+        if (mongoose.connection.readyState !== 1 || !tcgdexCardId) return [];
+        // "swsh9.5tg-TG02" -> "swsh9.5tg"
+        const setId = String(tcgdexCardId).split('-')[0];
+        if (!setId) return [];
+        const exps = await NumeroCarte.distinct('idExpansion', { setTcgdex: setId });
+        return exps.filter(e => e != null);
+    } catch (e) {
+        console.error("Erreur expansionsDuSetTCGdex :", e.message);
+        return [];
+    }
 }
 
 // Correspondance état Vinted -> état Cardmarket (minimum demandé).
@@ -1005,7 +1028,8 @@ app.post('/api/analyser', verifierJeton, async (req, res) => {
             if (produits.length === 1) {
                 classement = [{ candidat: produits[0], confiant: true }];
             } else if (produits.length > 1) {
-                const { scores, confiant } = await scorerCandidatsLocal(produits, cardInfo, imageUrl);
+                const expAttendues = await expansionsDuSetTCGdex(trouvailleTCGdex.id);
+                const { scores, confiant } = await scorerCandidatsLocal(produits, cardInfo, imageUrl, expAttendues);
                 // scores est déjà trié par score décroissant ; on récupère les produits complets
                 classement = scores.map(s => ({
                     candidat: produits.find(p => p.idProduct === s.candidat.idProduct),
@@ -1239,12 +1263,16 @@ app.post('/api/identifier', verifierJeton, async (req, res) => {
         const produits = await trouverProduitsLocaux(nomPourCatalogue);
         console.log(`🗂️ [identifier] ${produits.length} candidat(s) pour "${nomPourCatalogue}".`);
 
+        // Le set TCGdex nous dit dans quelle(s) expansion(s) Cardmarket chercher.
+        // Si TCGdex s'est trompé de carte (numéro incohérent), on n'utilise pas son set.
+        const expansionsAttendues = tcgdexDouteux ? [] : await expansionsDuSetTCGdex(trouvaille.id);
+
         // 4. Scoring : on renvoie le CLASSEMENT, l'extension testera dans l'ordre
         let classement = [];
         if (produits.length === 1) {
             classement = [{ idProduct: produits[0].idProduct, idExpansion: produits[0].idExpansion, score: 999 }];
         } else if (produits.length > 1) {
-            const { scores, confiant } = await scorerCandidatsLocal(produits, cardInfo, photos[0]);
+            const { scores, confiant } = await scorerCandidatsLocal(produits, cardInfo, photos[0], expansionsAttendues);
             classement = scores.map(s => ({
                 idProduct: s.candidat.idProduct,
                 idExpansion: s.candidat.idExpansion,
