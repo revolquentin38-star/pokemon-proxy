@@ -1220,9 +1220,24 @@ app.post('/api/identifier', verifierJeton, async (req, res) => {
             return res.json({ success: false, error: `Carte "${cardInfo.name}" #${cardInfo.number} non trouvée sur TCGdex`, cardInfo });
         }
 
+        // Garde-fou : si le numéro de la carte trouvée contredit celui lu sur la photo,
+        // c'est que TCGdex s'est trompé de carte (typiquement : set trop récent, absent
+        // de sa base -> il retombe sur une homonyme d'un autre set). Dans ce cas on ne
+        // se fie plus à son nom : on repart de ce que l'IA a lu.
+        const numLuIA = String(cardInfo.number || '').replace(/^0+/, '').toLowerCase();
+        const numTCG = String(trouvaille.localId || '').replace(/^0+/, '').toLowerCase();
+        let nomPourCatalogue = trouvaille.nomExact;
+        let tcgdexDouteux = false;
+        if (numLuIA && numTCG && numLuIA !== numTCG) {
+            tcgdexDouteux = true;
+            nomPourCatalogue = cardInfo.name;
+            console.log(`⚠️ [identifier] TCGdex renvoie le n°${numTCG} alors que l'IA a lu ${numLuIA} : set probablement trop récent pour TCGdex.`);
+            console.log(`   -> on cherche dans le catalogue avec le nom lu par l'IA ("${cardInfo.name}") plutôt qu'avec celui de TCGdex.`);
+        }
+
         // 3. Candidats Cardmarket via le catalogue local
-        const produits = await trouverProduitsLocaux(trouvaille.nomExact);
-        console.log(`🗂️ [identifier] ${produits.length} candidat(s) pour "${trouvaille.nomExact}".`);
+        const produits = await trouverProduitsLocaux(nomPourCatalogue);
+        console.log(`🗂️ [identifier] ${produits.length} candidat(s) pour "${nomPourCatalogue}".`);
 
         // 4. Scoring : on renvoie le CLASSEMENT, l'extension testera dans l'ordre
         let classement = [];
@@ -1260,7 +1275,8 @@ app.post('/api/identifier', verifierJeton, async (req, res) => {
                 langue: cardInfo.language,
                 rareteElevee: cardInfo.rareteElevee,
                 tcgdexId: trouvaille.id,
-                ambigu: Boolean(trouvaille.ambigu)
+                // Incertain si TCGdex hésitait, OU s'il s'est manifestement trompé de carte
+                ambigu: Boolean(trouvaille.ambigu || tcgdexDouteux)
             },
             etat: {
                 estimeIA: cardInfo.etatEstime || null,
