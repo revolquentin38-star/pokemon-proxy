@@ -1,0 +1,6 @@
+.env
+node_modules/
+chrome-profil/
+products_singles_6.json
+price_guide_6.json
+*.json.backup
