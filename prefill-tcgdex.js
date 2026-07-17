@@ -20,7 +20,6 @@ const mongoose = require('mongoose');
 const axios = require('axios');
 
 const ECRIRE = process.argv.includes('--ecrire');
-const SEUIL_CONFIANCE = 0.5; // % de noms communs pour valider l'appariement d'un set
 
 // ---- Modèles ----
 const numeroCarteSchema = new mongoose.Schema({
@@ -111,16 +110,39 @@ async function chargerSetsTCGdex() {
     return resultat;
 }
 
-// ---- 2. Apparier une expansion Cardmarket au bon set TCGdex ----
-// ⚠️ Le score doit pénaliser l'écart de taille. Avec un simple
-// "communs / plus petit des deux", une promo de 5 cartes dont les noms existent
-// dans un gros set obtiendrait un score parfait — et se verrait attribuer les
-// numéros du mauvais set. On utilise donc l'indice de Jaccard :
-//     communs / (taille union)
-// qui n'est élevé que si les deux ensembles se recouvrent VRAIMENT.
-function trouverMeilleurSet(nomsExpansion, setsTCGdex) {
+// ---- 2. Apparier une expansion Cardmarket aux set(s) TCGdex correspondants ----
+// Deux situations opposées, qu'il ne faut surtout pas confondre :
+//
+//   DANGEREUX : une petite expansion CM (5 promos) dont tous les noms existent
+//     dans un gros set TCGdex (200 cartes). Les numéros n'ont rien à voir.
+//     Signature : couverture CM haute, couverture TCGdex très basse.
+//
+//   LÉGITIME : un sous-ensemble TCGdex (Trainer Gallery = 30 cartes) entièrement
+//     contenu dans une expansion CM (Astral Radiance = 250 cartes), parce que
+//     Cardmarket ne sépare pas les Trainer Gallery du set principal.
+//     Signature : couverture TCGdex quasi totale.
+//
+// Une expansion CM peut donc correspondre à PLUSIEURS sets TCGdex à la fois
+// (le set principal + sa Trainer Gallery) : on les renvoie tous.
+// Un sous-ensemble LÉGITIME (Trainer Gallery, Shiny Vault, Galarian Gallery) se
+// reconnaît à sa NUMÉROTATION PRÉFIXÉE : TG01, SV001, GG01... C'est justement ce
+// qui lui permet de cohabiter avec le set principal dans la même expansion
+// Cardmarket, sans collision de numéros.
+// Un vrai set (Base Set 2, McDonald's, Énergies) a des numéros simples (1, 2, 3...)
+// et possède sa propre expansion : sa "présence" dans un gros set n'est qu'une
+// coïncidence de noms de Pokémon.
+function estGalerieNumerotee(set) {
+    const ids = set.cartes.map(c => String(c.localId));
+    if (ids.length === 0) return false;
+    const prefixes = ids.filter(id => /^[A-Za-z]{2,3}\d+$/.test(id)).length;
+    return prefixes / ids.length >= 0.9; // quasi toutes les cartes préfixées
+}
+
+const COUVERTURE_SOUS_ENSEMBLE = 0.8; // un set TCGdex "contenu" doit l'être presque entièrement
+
+function trouverSetsTCGdex(nomsExpansion, setsTCGdex) {
     const cible = new Set(nomsExpansion);
-    let meilleur = null, meilleurScore = 0;
+    const retenus = [];
 
     for (const set of setsTCGdex) {
         const nomsSet = new Set(set.cartes.map(c => c.nomNorm));
@@ -128,18 +150,25 @@ function trouverMeilleurSet(nomsExpansion, setsTCGdex) {
         for (const n of cible) if (nomsSet.has(n)) communs++;
         if (communs === 0) continue;
 
-        const union = cible.size + nomsSet.size - communs;
-        const jaccard = communs / union;
-
-        // Garde-fou supplémentaire : les deux sets doivent se recouvrir dans les
-        // DEUX sens (une expansion ne peut pas être "incluse" dans un set 10x plus gros)
         const couvertureCM = communs / cible.size;
         const couvertureTCG = communs / nomsSet.size;
-        if (couvertureCM < 0.5 || couvertureTCG < 0.5) continue;
+        const jaccard = communs / (cible.size + nomsSet.size - communs);
 
-        if (jaccard > meilleurScore) { meilleurScore = jaccard; meilleur = set; }
+        // Cas 1 : les deux ensembles se recouvrent largement -> même set
+        const memeSet = couvertureCM >= 0.5 && couvertureTCG >= 0.5;
+        // Cas 2 : galerie à numérotation préfixée, contenue dans l'expansion
+        const sousEnsemble = !memeSet
+            && couvertureTCG >= COUVERTURE_SOUS_ENSEMBLE
+            && communs >= 5
+            && estGalerieNumerotee(set);
+
+        if (memeSet || sousEnsemble) {
+            retenus.push({ set, jaccard, couvertureCM, couvertureTCG, sousEnsemble });
+        }
     }
-    return { set: meilleur, score: meilleurScore };
+
+    retenus.sort((a, b) => b.jaccard - a.jaccard);
+    return retenus;
 }
 
 // ---- 3. Programme principal ----
@@ -171,19 +200,112 @@ async function main() {
     const appariements = [];      // pour contrôle visuel
     const usageSetTCG = new Map(); // combien d'expansions pointent vers le même set TCGdex
 
-    // --- PASSE 1 : apparier chaque expansion à un set TCGdex ---
-    // (on ne peut pas encore construire les opérations : il faut d'abord savoir
-    //  quels sets TCGdex sont partagés par plusieurs expansions)
-    const correspondances = [];
+    // --- PASSE 1 : appariements DIRECTS uniquement (les deux sens ≥ 50 %) ---
+    // On repère d'abord quels sets TCGdex ont leur PROPRE expansion Cardmarket.
+    const revendiques = new Set();
+    const brut = [];
     for (const [idExpansion, prods] of parExpansion) {
         const nomsNorm = prods.map(p => normaliserNom(p.name));
-        const { set, score } = trouverMeilleurSet(nomsNorm, setsTCGdex);
+        const retenus = trouverSetsTCGdex(nomsNorm, setsTCGdex);
+        brut.push({ idExpansion, prods, retenus });
+        for (const r of retenus) if (!r.sousEnsemble) revendiques.add(r.set.id);
+    }
 
-        if (!set || score < SEUIL_CONFIANCE) { setsRates++; continue; }
+    // --- PASSE 1bis : filtrer les sous-ensembles ---
+    // Un sous-ensemble n'est LÉGITIME que s'il n'a pas déjà sa propre expansion
+    // Cardmarket. C'est ce qui distingue :
+    //   - Trainer Gallery : Cardmarket la range DANS le set principal -> légitime
+    //   - McDonald's / Trainer Kit / Énergies : ils ONT leur propre expansion,
+    //     donc leur présence "dans" un gros set n'est qu'une coïncidence de noms
+    //     (Pikachu, Raichu... existent partout) -> à rejeter.
+    const usageSousEnsemble = new Map();
+    for (const { retenus } of brut) {
+        for (const r of retenus) {
+            if (r.sousEnsemble && !revendiques.has(r.set.id)) {
+                usageSousEnsemble.set(r.set.id, (usageSousEnsemble.get(r.set.id) || 0) + 1);
+            }
+        }
+    }
+
+    // Second garde-fou : un vrai sous-ensemble appartient à UNE expansion.
+    // Ceux réclamés par beaucoup d'expansions sont des faux (Énergies de base...).
+    const MAX_EXPANSIONS_PAR_SOUS_ENSEMBLE = 2;
+    const sousEnsemblesValides = new Set(
+        [...usageSousEnsemble.entries()]
+            .filter(([, n]) => n <= MAX_EXPANSIONS_PAR_SOUS_ENSEMBLE)
+            .map(([id]) => id)
+    );
+
+    const rejetesCarRevendiques = [...new Set(brut.flatMap(b => b.retenus.filter(r => r.sousEnsemble && revendiques.has(r.set.id)).map(r => r.set.id)))];
+    if (rejetesCarRevendiques.length) {
+        console.log(`🚫 ${rejetesCarRevendiques.length} faux sous-ensemble(s) écarté(s) : ils ont leur PROPRE expansion Cardmarket`);
+        console.log(`   (ex: ${rejetesCarRevendiques.slice(0, 4).join(', ')}) — leur présence dans un gros set n'est qu'une coïncidence de noms.\n`);
+    }
+
+    const correspondances = [];
+    let sousEnsemblesRecuperes = 0;
+    let concurrentsEcartes = 0;
+    let rejetesCarConcurrents = 0;
+
+    for (const { idExpansion, prods, retenus } of brut) {
+        const principaux = retenus.filter(r => !r.sousEnsemble);
+        let sousEns = retenus.filter(r => r.sousEnsemble && sousEnsemblesValides.has(r.set.id));
+
+        // Si PLUSIEURS sets se disent contenus dans la même expansion, c'est une
+        // coïncidence de noms communs, pas une vraie inclusion. Cas typique : Base
+        // Set, Base Set 2, Legendary Collection et FireRed partagent tous les mêmes
+        // ~150 noms de Pokémon -> indiscernables par empreinte. Un vrai sous-ensemble
+        // (Trainer Gallery) est SEUL à être contenu dans son set.
+        if (sousEns.length > 1) {
+            rejetesCarConcurrents += sousEns.length;
+            sousEns = [];
+        }
+
+        // Une expansion Cardmarket n'a QU'UN seul set principal. Or plusieurs sets
+        // TCGdex peuvent matcher par les noms : "151" est un remake des 151 Pokémon
+        // d'origine, donc Base Set 2 / Legendary Collection / FireRed contiennent le
+        // MÊME casting et matchent tout autant. Les noms seuls ne les distinguent
+        // pas -> on ne garde que le MEILLEUR (jaccard le plus élevé).
+        const meilleurPrincipal = principaux[0] || null; // déjà trié par jaccard
+        if (principaux.length > 1) concurrentsEcartes += principaux.length - 1;
+
+        const valides = [];
+        if (meilleurPrincipal) valides.push(meilleurPrincipal);
+        valides.push(...sousEns);
+
+        if (valides.length === 0) { setsRates++; continue; }
         setsApparies++;
-        correspondances.push({ idExpansion, prods, set, score });
-        appariements.push({ idExpansion, taille: prods.length, setNom: set.name, setId: set.id, score });
-        usageSetTCG.set(set.id, (usageSetTCG.get(set.id) || 0) + 1);
+
+        const cartesFusionnees = [];
+        for (const r of valides) {
+            cartesFusionnees.push(...r.set.cartes);
+            usageSetTCG.set(r.set.id, (usageSetTCG.get(r.set.id) || 0) + 1);
+            if (r.sousEnsemble) sousEnsemblesRecuperes++;
+        }
+
+        const principal = valides[0].set;
+        const setFusionne = { id: principal.id, name: principal.name, cartes: cartesFusionnees };
+        correspondances.push({ idExpansion, prods, set: setFusionne, retenus: valides });
+
+        appariements.push({
+            idExpansion, taille: prods.length,
+            setNom: valides.map(r => r.set.name + (r.sousEnsemble ? ' [sous-ens.]' : '')).join(' + '),
+            setId: principal.id,
+            tousSetIds: valides.map(r => r.set.id),
+            score: valides[0].jaccard,
+            nbSets: valides.length
+        });
+    }
+    if (rejetesCarConcurrents) {
+        console.log(`🚫 ${rejetesCarConcurrents} sous-ensemble(s) écarté(s) : plusieurs se disputaient la même expansion`);
+        console.log(`   (coïncidence de noms communs — ex: tous les sets de l'ère Base partagent les mêmes 150 Pokémon).\n`);
+    }
+    if (concurrentsEcartes) {
+        console.log(`🚫 ${concurrentsEcartes} set(s) TCGdex concurrent(s) écarté(s) : une expansion n'a qu'UN set principal.`);
+        console.log(`   (ex: "151" et "Base Set 2" partagent les mêmes 151 Pokémon -> indiscernables par les noms.)\n`);
+    }
+    if (sousEnsemblesRecuperes) {
+        console.log(`🎁 ${sousEnsemblesRecuperes} vrai(s) sous-ensemble(s) récupéré(s) (Trainer Gallery, Shiny Vault...).\n`);
     }
 
     // --- PASSE 2 : construire les opérations, en tenant compte des sets partagés ---
@@ -278,11 +400,15 @@ async function main() {
     const doublons = [...usageSetTCG.entries()].filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]);
     if (doublons.length) {
         console.log(`\n⚠️ ${doublons.length} set(s) TCGdex apparié(s) à PLUSIEURS expansions Cardmarket.`);
-        console.log(`   C'est parfois normal (une expansion + ses "Suppléments"), mais si les`);
-        console.log(`   chiffres sont élevés, l'appariement est douteux. Top 5 :`);
+        console.log(`   C'est souvent normal (éditions JP / internationale / suppléments du même set).`);
+        console.log(`   Ces cartes sont marquées 'heuristique'. Top 5 :`);
         for (const [setId, n] of doublons.slice(0, 5)) {
-            const exs = appariements.filter(a => a.setId === setId);
-            console.log(`   - ${setId} ("${exs[0].setNom}") <- ${n} expansions : ${exs.map(e => e.idExpansion + ' (' + e.taille + ' cartes)').join(', ')}`);
+            // On cherche dans TOUS les setId retenus (pas seulement le principal),
+            // sinon un sous-ensemble ne serait pas trouvé -> plantage.
+            const exs = appariements.filter(a => (a.tousSetIds || [a.setId]).includes(setId));
+            const nom = exs[0]?.setNom || '(inconnu)';
+            const listeExp = exs.slice(0, 6).map(e => e.idExpansion).join(', ');
+            console.log(`   - ${setId} <- ${n} expansions : ${listeExp}${exs.length > 6 ? '...' : ''}`);
         }
     } else {
         console.log(`\n✅ Aucun set TCGdex apparié à deux expansions : appariement sain.`);
@@ -291,7 +417,7 @@ async function main() {
     // --- Contrôle visuel : les 8 plus gros appariements ---
     console.log(`\n🔍 Vérifie ces appariements à l'oeil (les 8 plus gros) :`);
     appariements.sort((a, b) => b.taille - a.taille).slice(0, 8).forEach(a => {
-        console.log(`   Expansion ${a.idExpansion} (${a.taille} cartes) -> "${a.setNom}" [${a.setId}] — score ${(a.score * 100).toFixed(0)}%`);
+        console.log(`   Expansion ${a.idExpansion} (${a.taille} cartes) -> "${a.setNom}" — score ${(a.score * 100).toFixed(0)}%`);
     });
 
     if (!ECRIRE) {

@@ -43,6 +43,11 @@ const CatalogueProduit = mongoose.model('CatalogueProduit', catalogueSchema, 'ca
 
 const MAX_ECHECS_CONSECUTIFS = 2; // 2 sets vides d'affilée = probablement banni -> on arrête
 
+// Pause entre deux SETS (en plus du délai entre pages). Un scraping soutenu de
+// plusieurs heures est ce qui a déclenché les bans : on souffle entre chaque set.
+const PAUSE_ENTRE_SETS_MIN_MS = 60000;  // 1 min
+const PAUSE_ENTRE_SETS_MAX_MS = 180000; // 3 min
+
 let apercu = null; // 1re carte du dernier set appris, pour vérification à l'oeil
 
 async function apprendreUnSet(idExpansion) {
@@ -68,7 +73,7 @@ async function apprendreUnSet(idExpansion) {
 
 async function main() {
     const args = process.argv.slice(2);
-    const limite = parseInt(args.find(a => /^\d+$/.test(a)), 10) || 10;
+    const limite = parseInt(args.find(a => /^\d+$/.test(a)), 10) || 5; // petit lot par défaut : mieux vaut plusieurs sessions courtes
     const inclurePetits = args.includes('--petits');
     const majAnciens = args.includes('--maj');
 
@@ -137,6 +142,14 @@ async function main() {
             console.log(`   ❌ Erreur : ${err.message}`);
             echecs++;
             if (echecs >= MAX_ECHECS_CONSECUTIFS) break;
+        }
+
+        // Souffler entre deux sets (durée aléatoire) : c'est l'enchaînement soutenu
+        // qui déclenche les bans, pas une page isolée.
+        if (i < lot.length - 1) {
+            const pause = PAUSE_ENTRE_SETS_MIN_MS + Math.random() * (PAUSE_ENTRE_SETS_MAX_MS - PAUSE_ENTRE_SETS_MIN_MS);
+            console.log(`   💤 Pause ${(pause / 60000).toFixed(1)} min avant le set suivant...`);
+            await new Promise(r => setTimeout(r, pause));
         }
     }
 

@@ -31,7 +31,13 @@ function bip() {
 
 // ---- Config ----
 const CHEMIN_PROFIL = path.join(__dirname, 'chrome-profil'); // profil persistant = cookie Cloudflare gardé
-const DELAI_MIN_ENTRE_REQUETES_MS = 8000; // au moins 8s entre deux fiches (anti-ban 1015)
+// Délai entre deux requêtes. Deux principes :
+//  1. LONG : le volume est ce qui déclenche les bans (1015 puis 1020).
+//  2. IRRÉGULIER : un intervalle constant (toutes les 8s pile) est une signature
+//     de robot à lui seul — aucun humain ne navigue au métronome. On tire donc
+//     un délai au hasard dans une fourchette.
+const DELAI_MIN_MS = 20000; // 20 s
+const DELAI_MAX_MS = 45000; // 45 s
 const TIMEOUT_NAVIGATION_MS = 45000;
 const TIMEOUT_CLOUDFLARE_MS = 90000;
 
@@ -220,10 +226,12 @@ async function fermerBrowser() {
 
 // Respecte le délai minimum entre deux requêtes (anti-ban)
 async function respecterDelai() {
+    // Cible tirée au hasard : le rythme ne doit pas être prévisible
+    const cible = DELAI_MIN_MS + Math.random() * (DELAI_MAX_MS - DELAI_MIN_MS);
     const ecoule = Date.now() - _dernvereRequete;
-    if (ecoule < DELAI_MIN_ENTRE_REQUETES_MS) {
-        const attente = DELAI_MIN_ENTRE_REQUETES_MS - ecoule;
-        console.log(`⏱️ Attente anti-ban : ${(attente / 1000).toFixed(1)}s...`);
+    if (ecoule < cible) {
+        const attente = cible - ecoule;
+        console.log(`⏱️ Pause ${(attente / 1000).toFixed(0)}s...`);
         await new Promise(r => setTimeout(r, attente));
     }
     _dernvereRequete = Date.now();
