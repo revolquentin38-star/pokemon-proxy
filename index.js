@@ -414,82 +414,16 @@ async function chercherPrixCatalogueLocal(name) {
 
 
 // ============================================================
-// ÉTAPE 2 — Si ambigu localement : TCGdex (gratuit, sans clé) + comparaison
-// d'image. Docs : https://tcgdex.dev/markets-prices
+// ÉTAPE 2 — Identification via TCGdex (gratuit, sans clé)
 // ============================================================
-
-const sharp = require('sharp');
-const https = require('https');
-
-// Télécharge une image (avec header Referer, nécessaire pour le CDN Cardmarket
-// qui bloque le hotlink sinon). Renvoie un Buffer.
-function telechargerImage(url) {
-    return new Promise((resolve, reject) => {
-        const opts = { headers: { 'Referer': 'https://www.cardmarket.com/', 'User-Agent': 'Mozilla/5.0' } };
-        https.get(url, opts, res => {
-            if (res.statusCode !== 200) { res.destroy(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
-            const chunks = [];
-            res.on('data', c => chunks.push(c));
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-        }).on('error', reject);
-    });
-}
-
-// Hash perceptif (dHash 8x8 = 64 bits) via sharp — gère WebP (Vinted) ET JPG (Cardmarket),
-// contrairement à Jimp v1 qui ne décode pas le WebP.
-async function calculerHashImage(source) {
-    const buffer = Buffer.isBuffer(source) ? source : await telechargerImage(source);
-    const { data } = await sharp(buffer).greyscale().resize(9, 8, { fit: 'fill' }).raw().toBuffer({ resolveWithObject: true });
-    let hash = '';
-    for (let y = 0; y < 8; y++)
-        for (let x = 0; x < 8; x++)
-            hash += data[y * 9 + x] > data[y * 9 + x + 1] ? '1' : '0';
-    return hash;
-}
-
-function distanceHamming(hashA, hashB) {
-    let distance = 0;
-    for (let i = 0; i < hashA.length; i++) if (hashA[i] !== hashB[i]) distance++;
-    return distance;
-}
-
-// URL de l'image S3 Cardmarket pour un idProduct + code set connus
-function urlImageCardmarket(idProduct, codeSet, idCategory = 51) {
-    return `https://product-images.s3.cardmarket.com/${idCategory}/${codeSet}/${idProduct}/${idProduct}.jpg`;
-}
-
-const SEUIL_HASH_CONFIANT = 20;
-
-async function departagerParImage(imageUrlVinted, candidats) {
-    if (!imageUrlVinted) return null;
-    try {
-        const hashVinted = await calculerHashImage(imageUrlVinted);
-        let meilleur = null;
-        let meilleureDistance = Infinity;
-
-        for (const candidat of candidats) {
-            if (!candidat.image) continue;
-            try {
-                const hashCandidat = await calculerHashImage(`${candidat.image}/low.webp`);
-                const distance = distanceHamming(hashVinted, hashCandidat);
-                console.log(`🖼️ Distance image "${candidat.id}" : ${distance}/64`);
-                if (distance < meilleureDistance) { meilleureDistance = distance; meilleur = candidat; }
-            } catch (e) {
-                console.log(`⚠️ Comparaison image impossible pour "${candidat.id}" : ${e.message}`);
-            }
-        }
-
-        if (meilleur) {
-            const confiant = meilleureDistance <= SEUIL_HASH_CONFIANT;
-            console.log(`🖼️ Meilleure correspondance : "${meilleur.id}" (distance ${meilleureDistance}/64)${confiant ? '' : ' — encore incertain'}`);
-            return { candidat: meilleur, confiant };
-        }
-        return null;
-    } catch (e) {
-        console.log(`⚠️ Erreur hash de l'image Vinted : ${e.message}`);
-        return null;
-    }
-}
+// NOTE : la comparaison d'images (hash perceptif via sharp) a été RETIRÉE.
+// Mesuré en conditions réelles : sur des photos d'annonce (angle, reflets,
+// carte sous sleeve), les distances tournaient entre 21 et 41/64 — aucune ne se
+// détachait, et le hash désignait parfois la MAUVAISE carte. Il apportait ~15
+// points de bruit face au numéro (50), à la région (±45) et au set (40), qui
+// décident réellement.
+// Le retirer supprime au passage la dépendance à `sharp` (module natif, lourd en
+// RAM), ce qui allège le déploiement et rend l'architecture portable en extension.
 
 // Langues supportées par TCGdex pour la recherche (codes ISO)
 const LANGUES_TCGDEX = ['en', 'fr', 'de', 'es', 'it', 'pt', 'ja', 'ko', 'zh-cn', 'zh-tw', 'nl', 'pl', 'ru', 'id', 'th'];
@@ -607,28 +541,20 @@ async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted, langue 
         if (resultats.length > 1) {
             console.log(`ℹ️ TCGdex : ${resultats.length} résultats pour "${nomUtilise}" #${number} :`, resultats.map(r => r.id));
 
-            // 1er départage : comparaison visuelle avec la photo Vinted (comme PokéCardex/
-            // les vraies apps de scan) — l'illustration est plus fiable que le texte pour
-            // distinguer deux cartes qui partagent le même nom et le même numéro.
-            console.log(`ℹ️ Tentative de départage par image...`);
-            const resultatImage = await departagerParImage(imageUrlVinted, resultats);
+            // Départage par le code du set lu par l'IA. (La comparaison d'images a été
+            // retirée : sur des photos d'annonce, elle donnait 35-41/64 même pour la
+            // bonne carte — donc aucun signal exploitable.)
+            const correspondance = setCode ? resultats.find(r => r.id.toLowerCase().includes(setCode.toLowerCase())) : null;
 
-            if (resultatImage?.confiant) {
-                choisi = resultatImage.candidat;
+            if (correspondance) {
+                choisi = correspondance;
+                console.log(`ℹ️ Départage par le set "${setCode}".`);
             } else {
-                // 2e départage (filet de sécurité) : le code du set détecté par l'IA,
-                // seulement si l'image n'a pas donné un résultat assez net (photo floue,
-                // image de référence introuvable, etc.)
-                const correspondance = setCode ? resultats.find(r => r.id.toLowerCase().includes(setCode.toLowerCase())) : null;
-
-                if (correspondance) {
-                    choisi = correspondance;
-                    console.log(`ℹ️ Image non concluante, départage par set "${setCode}" à la place.`);
-                } else {
-                    if (resultatImage) choisi = resultatImage.candidat; // meilleur choix informé plutôt qu'au hasard
-                    ambigu = true;
-                    console.log(`⚠️ ${resultats.length} impressions possibles pour "${name}" #${number}, résultat incertain même après image + set.`);
-                }
+                // Aucun moyen de trancher ici : on prend le premier mais on signale
+                // l'incertitude. Le garde-fou live vérifiera le numéro et rebondira
+                // si besoin — c'est lui qui garantit la justesse, pas ce choix.
+                ambigu = true;
+                console.log(`⚠️ ${resultats.length} impressions possibles pour "${name}" #${number} et pas de set pour trancher — le live vérifiera.`);
             }
         }
 
@@ -838,17 +764,10 @@ async function getPrixGuideLocal(idProduct) {
 }
 
 // ============================================================
-// Enrichit les candidats (prix local + hash image S3) puis les score.
+// Enrichit les candidats (numéro appris + prix local + région) puis les score.
 // NIVEAU 1 : 100% local, aucune requête Cardmarket, aucun risque de ban.
 // ============================================================
 async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted, idExpansionsAttendues = []) {
-    // Hash de la photo Vinted (une seule fois)
-    let hashVinted = null;
-    if (imageUrlVinted) {
-        try { hashVinted = await calculerHashImage(imageUrlVinted); }
-        catch (e) { console.log(`ℹ️ Hash photo Vinted impossible : ${e.message}`); }
-    }
-
     const regionCible = regionAttendue(cardInfo);
     console.log(`🌍 Région attendue : ${regionCible || 'indéterminée'} (langue=${cardInfo.language}, total=${cardInfo.total || 'absent'})`);
 
@@ -866,25 +785,18 @@ async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted, idExpans
     for (const p of produits) {
         const codeSet = await lireCodeSet(p.idExpansion); // connu si déjà appris
         const infoNum = numerosConnus.get(p.idProduct);
-        const enrichi = {
+        candidatsEnrichis.push({
             idProduct: p.idProduct,
             idExpansion: p.idExpansion,
             numeroCardmarket: infoNum ? (infoNum.numero || infoNum.numeroUrl) : null,
             certitudeNumero: infoNum ? (infoNum.certitude || 'exacte') : null,
             prix: await getPrixGuideLocal(p.idProduct),
-            distanceImage: null,
+            // distanceImage volontairement absente : le hash perceptif a été retiré
+            // (bruit sur photos d'annonce). Le critère image du scoring reste dans
+            // scoring.js et se réactivera tout seul si on lui refournit un jour une
+            // distance (via OffscreenCanvas côté extension, par exemple).
             region: regionDuCodeSet(codeSet || (infoNum && infoNum.codeSet))
-        };
-
-        // Image : seulement si on connaît le code set de cette expansion (mémorisé)
-        const codeImage = codeSet || (infoNum && infoNum.codeSet);
-        if (hashVinted && codeImage) {
-            try {
-                const buf = await telechargerImage(urlImageCardmarket(p.idProduct, codeImage));
-                enrichi.distanceImage = distanceHamming(hashVinted, await calculerHashImage(buf));
-            } catch (e) { /* image indispo, on laisse null */ }
-        }
-        candidatsEnrichis.push(enrichi);
+        });
     }
 
     if (idExpansionsAttendues.length) {
