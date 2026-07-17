@@ -952,16 +952,32 @@ function pireEtat(a, b) {
 // Retrouve les idExpansion Cardmarket correspondant à un set TCGdex.
 // C'est le "pont" qui manquait : le pré-remplissage TCGdex a stocké, pour chaque
 // carte, le set d'où venait son numéro (champ setTcgdex). En interrogeant cette
-// trace, on sait enfin dans quelle(s) expansion(s) Cardmarket chercher — ce qui
-// active le critère "set" du scoring (40 points), jusqu'ici toujours inutilisé.
-async function expansionsDuSetTCGdex(tcgdexCardId) {
+// trace, on sait dans quelle(s) expansion(s) Cardmarket chercher — ce qui active
+// le critère "set" du scoring (40 points).
+//
+// ⚠️ Un set TCGdex couvre souvent PLUSIEURS éditions Cardmarket (japonaise,
+// internationale, suppléments) : les cartes y portent les mêmes noms. Sans filtre,
+// on pourrait donc récompenser l'édition japonaise alors que la carte est
+// française. On ne retient que les expansions de la RÉGION attendue.
+async function expansionsDuSetTCGdex(tcgdexCardId, regionAttendue = null) {
     try {
         if (mongoose.connection.readyState !== 1 || !tcgdexCardId) return [];
-        // "swsh9.5tg-TG02" -> "swsh9.5tg"
         const setId = String(tcgdexCardId).split('-')[0];
         if (!setId) return [];
-        const exps = await NumeroCarte.distinct('idExpansion', { setTcgdex: setId });
-        return exps.filter(e => e != null);
+
+        const exps = (await NumeroCarte.distinct('idExpansion', { setTcgdex: setId })).filter(e => e != null);
+        if (!regionAttendue || exps.length === 0) return exps;
+
+        // Filtrage par région, via le code set appris (MAJ = occidental, min = japonais)
+        const gardees = [];
+        for (const e of exps) {
+            const code = await lireCodeSet(e);
+            const region = regionDuCodeSet(code);
+            // Région inconnue -> on garde (on ne pénalise pas ce qu'on ignore)
+            if (!region || region === regionAttendue) gardees.push(e);
+            else console.log(`   ℹ️ Expansion ${e} (${code}, ${region}) écartée du set attendu : on cherche de l'${regionAttendue}.`);
+        }
+        return gardees;
     } catch (e) {
         console.error("Erreur expansionsDuSetTCGdex :", e.message);
         return [];
@@ -1028,7 +1044,7 @@ app.post('/api/analyser', verifierJeton, async (req, res) => {
             if (produits.length === 1) {
                 classement = [{ candidat: produits[0], confiant: true }];
             } else if (produits.length > 1) {
-                const expAttendues = await expansionsDuSetTCGdex(trouvailleTCGdex.id);
+                const expAttendues = await expansionsDuSetTCGdex(trouvailleTCGdex.id, regionAttendue(cardInfo));
                 const { scores, confiant } = await scorerCandidatsLocal(produits, cardInfo, imageUrl, expAttendues);
                 // scores est déjà trié par score décroissant ; on récupère les produits complets
                 classement = scores.map(s => ({
@@ -1265,7 +1281,7 @@ app.post('/api/identifier', verifierJeton, async (req, res) => {
 
         // Le set TCGdex nous dit dans quelle(s) expansion(s) Cardmarket chercher.
         // Si TCGdex s'est trompé de carte (numéro incohérent), on n'utilise pas son set.
-        const expansionsAttendues = tcgdexDouteux ? [] : await expansionsDuSetTCGdex(trouvaille.id);
+        const expansionsAttendues = tcgdexDouteux ? [] : await expansionsDuSetTCGdex(trouvaille.id, regionAttendue(cardInfo));
 
         // 4. Scoring : on renvoie le CLASSEMENT, l'extension testera dans l'ordre
         let classement = [];
