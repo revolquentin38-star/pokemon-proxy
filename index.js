@@ -270,6 +270,12 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
     try {
         const response = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
             model: MODELE_IA,
+            // Température 0 : lire un numéro sur une carte n'est pas une tâche
+            // créative. Sans ça, le modèle "improvise" et donne des résultats
+            // différents sur la MÊME photo (vu en conditions réelles : rareté AR
+            // puis "normale", total TG30 puis absent -> 25 points d'écart au
+            // scoring et la confiance qui bascule de HAUTE à BASSE).
+            temperature: 0,
             messages: [{
                 role: "user",
                 content: [
