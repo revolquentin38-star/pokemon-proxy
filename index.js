@@ -569,16 +569,21 @@ async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted, langue 
         // Or le catalogue Cardmarket est en anglais -> on récupère le nom ANGLAIS via
         // l'id (universel) pour que la recherche catalogue fonctionne.
         let nomExact = choisi.name;
+        let variants = null;
         try {
             const detailEN = await axios.get(`https://api.tcgdex.net/v2/en/cards/${encodeURIComponent(choisi.id)}`, { timeout: 15000 });
             if (detailEN.data?.name) {
                 if (detailEN.data.name !== choisi.name) console.log(`🔤 Nom anglais récupéré : "${detailEN.data.name}" (trouvé en "${choisi.name}").`);
                 nomExact = detailEN.data.name;
             }
+            // variants = { normal, reverse, holo, firstEdition, wPromo } : dit quelles
+            // impressions EXISTENT. Récupéré gratuitement ici (même réponse que le nom).
+            // Sert à valider/infirmer la reverse lue par l'IA, sans scraper Cardmarket.
+            if (detailEN.data?.variants) variants = detailEN.data.variants;
         } catch (e) { /* on garde choisi.name si l'appel échoue */ }
 
         console.log(`🔗 Carte TCGdex retenue : ${choisi.id} ("${nomExact}")${ambigu ? ' [INCERTAIN]' : ''}`);
-        return { id: choisi.id, ambigu, nomExact, localId: choisi.localId || number };
+        return { id: choisi.id, ambigu, nomExact, localId: choisi.localId || number, variants };
 
     } catch (e) {
         console.error(`❌ Erreur recherche TCGdex pour "${name}" #${number} :`, e.response?.status, e.message);
@@ -1205,6 +1210,19 @@ app.post('/api/identifier', verifierJeton, async (req, res) => {
             nomPourCatalogue = cardInfo.name;
             console.log(`⚠️ [identifier] TCGdex renvoie le n°${numTCG} alors que l'IA a lu ${numLuIA} : set probablement trop récent pour TCGdex.`);
             console.log(`   -> on cherche dans le catalogue avec le nom lu par l'IA ("${cardInfo.name}") plutôt qu'avec celui de TCGdex.`);
+        }
+
+        // Validateur de reverse (TCGdex) : on ne garde "reverse=true" que si cette
+        // carte possède RÉELLEMENT une impression reverse. Neutralise les faux
+        // positifs (une holo normale lue à tort comme reverse par l'IA). On ne
+        // l'applique PAS si TCGdex s'est trompé de carte (variants d'une autre carte).
+        if (cardInfo.reverse === true && !tcgdexDouteux && trouvaille.variants) {
+            if (trouvaille.variants.reverse === false) {
+                console.log(`↩️ TCGdex : pas de reverse connue pour cette carte -> on ignore le "reverse" lu par l'IA.`);
+                cardInfo.reverse = false;
+            } else if (trouvaille.variants.reverse === true) {
+                console.log(`✅ TCGdex confirme qu'une reverse existe pour cette carte.`);
+            }
         }
 
         // 3. Candidats Cardmarket via le catalogue local
