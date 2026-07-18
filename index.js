@@ -70,11 +70,14 @@ const SEUIL_BONNE_AFFAIRE = 0.80; // 20% moins cher ou plus -> bonne affaire
 const SEUIL_PRIX_CORRECT  = 1.10; // jusqu'à 10% plus cher -> prix correct
 // au-dessus de SEUIL_PRIX_CORRECT -> trop cher
 
-// Modèle IA. google/gemini-2.5-flash = rapide et ~6x moins cher que
-// ~google/gemini-pro-latest pour cette tâche simple (lire une image + extraire du texte).
-// Si l'extraction se trompe souvent sur des cartes difficiles, remets
-// "~google/gemini-pro-latest" ici (plus précis, plus cher).
-const MODELE_IA = "google/gemini-2.5-flash";
+// Modèle IA pour lire la carte (OCR + extraction). google/gemini-3-flash =
+// actuellement en tête des classements OCR, pour ~1,5-2x le coût de l'ancien
+// 2.5-flash (qui sera arrêté en oct. 2026). Pour un maximum de précision sur
+// les cartes difficiles : "google/gemini-3.5-flash" (plus cher, ~4-5x).
+// Alternative moins chère à tester : "qwen/qwen3-vl-235b-a22b-instruct".
+// ⚠️ Vérifie l'ID exact sur https://openrouter.ai/models : un ID inconnu
+// renvoie une erreur "model not found" (sans casse : on ajuste et on relance).
+const MODELE_IA = "google/gemini-3-flash";
 
 // Interrupteur du scraping live Cardmarket. Mets à false pour tester sans aucune
 // requête vers Cardmarket (utile en cas de ban IP, ou pour un fonctionnement
