@@ -231,7 +231,7 @@ async function getCardIdFromAI(imageUrls, title) {
     const images = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [imageUrls].filter(Boolean);
     if (images.length === 0) return null;
     const prompt = `Identifie cette carte Pokémon à partir de l'image (le titre de l'annonce est un complément d'info, en français). Réponds UNIQUEMENT en JSON strict, sans texte ni markdown autour, format exact :
-{"name": "Nom anglais de la carte", "number": "numéro de collection SEUL sans le total (ex: 184)", "total": "le nombre APRÈS le slash (ex: 182 pour 184/182), ou null si absent", "setCode": "code du set (ex: BLK, PAL, OBF) si visible, sinon null", "rarete": "IR/SR/SIR/UR/AR/promo/normale selon ce que tu vois", "language": "EN", "etatEstime": "NM/EX/GD/LP/PL/PO", "etatConfiance": "haute/moyenne/basse", "defautsVus": ["liste courte des défauts visibles, [] si aucun"]}
+{"name": "Nom anglais de la carte", "number": "numéro de collection SEUL sans le total (ex: 184)", "total": "le nombre APRÈS le slash (ex: 182 pour 184/182), ou null si absent", "setCode": "code du set (ex: BLK, PAL, OBF) si visible, sinon null", "rarete": "IR/SR/SIR/UR/AR/promo/normale selon ce que tu vois", "reverse": "true/false/null — true SEULEMENT si c'est une REVERSE HOLO, false si tu es sûr que non, null si tu n'arrives pas à juger", "language": "EN", "etatEstime": "NM/EX/GD/LP/PL/PO", "etatConfiance": "haute/moyenne/basse", "defautsVus": ["liste courte des défauts visibles, [] si aucun"]}
 
 ÉVALUATION DE L'ÉTAT (etatEstime) — barème Cardmarket, du meilleur au pire : MT > NM > EX > GD > LP > PL > PO.
 - NM (Near Mint) : aucun défaut visible, bords nets, coins pointus.
@@ -262,6 +262,8 @@ Le "setCode" est le petit code alphabétique (2 à 4 lettres) imprimé en bas de
 
 Pour "rarete" : regarde le symbole de rareté et le style de la carte. "IR" = Illustration Rare (illustration pleine, personnage humain souvent), "SIR"/"SR" = Special/Super Rare, "AR" = Art Rare, "promo" = carte promotionnelle, "normale" = carte de jeu standard. Si tu n'es pas sûr, réponds "normale".
 ⚠️ NE CONFONDS PAS "rarete" et "etatEstime" : la rareté est une propriété d'IMPRESSION de la carte (IR, SR, promo, normale...), l'état est son USURE physique (NM, EX, GD...). N'écris JAMAIS un code d'état (EX, GD, NM...) dans le champ "rarete".
+
+Pour "reverse" : une REVERSE HOLO est une carte de jeu normale dont le motif holographique/brillant recouvre le FOND et les BORDURES (toute la carte scintille SAUF l'illustration), alors que sur une holo normale c'est l'ILLUSTRATION qui brille. Le numéro d'une reverse est IDENTIQUE à celui de la version normale. Réponds true UNIQUEMENT si tu distingues clairement ce scintillement de fond ; false si la carte est visiblement mate/normale ; null si reflets, sleeve ou photo ne permettent pas d'en être sûr. Ne devine pas.
 
 Pour "language", déduis-la du TEXTE VISIBLE SUR LA CARTE elle-même (pas du titre) : JP si texte japonais, FR si texte français, DE si allemand, IT si italien, ES si espagnol, PT si portugais, KR si coréen, ZH si chinois. Si tu n'es pas sûr, réponds "EN" par défaut.
 
@@ -314,6 +316,11 @@ Titre de l'annonce (contexte) : ${title || "(non fourni)"}`;
         // Normalisation des nouveaux champs pour le scoring
         parsed.total = parsed.total ? String(parsed.total).replace(/\D/g, '') : null;
         parsed.rarete = parsed.rarete || 'normale';
+        // reverse : on ne garde QUE true ou false explicites ; tout le reste ("null",
+        // absent, chaîne "null") devient null -> le scoring restera neutre dans le doute.
+        parsed.reverse = (parsed.reverse === true || parsed.reverse === 'true') ? true
+            : (parsed.reverse === false || parsed.reverse === 'false') ? false
+            : null;
         // Carte "à valeur" si : numéro > total (secrète), ou rareté spéciale lue par l'IA
         const numN = parseInt(String(parsed.number).replace(/\D/g, ''), 10);
         const totN = parsed.total ? parseInt(parsed.total, 10) : null;
@@ -790,6 +797,9 @@ async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted, idExpans
             idExpansion: p.idExpansion,
             numeroCardmarket: infoNum ? (infoNum.numero || infoNum.numeroUrl) : null,
             certitudeNumero: infoNum ? (infoNum.certitude || 'exacte') : null,
+            // V1/V2/V3 = normale/reverse/illustration, présente seulement sur les
+            // sets appris AVEC les nouveaux champs (--maj). Absente = null -> neutre.
+            variante: infoNum ? (infoNum.variante || null) : null,
             prix: await getPrixGuideLocal(p.idProduct),
             // distanceImage volontairement absente : le hash perceptif a été retiré
             // (bruit sur photos d'annonce). Le critère image du scoring reste dans
@@ -807,8 +817,12 @@ async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted, idExpans
         numero: cardInfo.number || null,   // le numéro lu par l'IA (ex: 79, TG06)
         idExpansionsAttendues,             // déduites du set TCGdex via le pré-remplissage
         rareteElevee: cardInfo.rareteElevee,
-        regionAttendue: regionCible
+        regionAttendue: regionCible,
+        // reverse lue -> on attend la variante V2. false/null -> pas d'exigence
+        // (on n'affirme PAS V1 : la carte pourrait être une illustration V3).
+        varianteAttendue: cardInfo.reverse === true ? 'V2' : null
     };
+    if (lu.varianteAttendue) console.log(`🔁 Reverse lue par l'IA -> on vise la variante ${lu.varianteAttendue}.`);
 
     return choisirMeilleur(candidatsEnrichis, lu);
 }

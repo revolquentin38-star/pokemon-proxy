@@ -1,29 +1,30 @@
 // ============================================================
 // MODULE SCORING — départage plusieurs idProduct candidats
 // ============================================================
-// Combine 4 signaux (numéro, set, image, prix) pour trouver LE bon idProduct
-// parmi plusieurs cartes de même nom. Aucun critère ne décide seul : c'est le
-// score total qui tranche, ce qui rend le système robuste aux erreurs
-// individuelles (IA qui lit mal, hash d'image imprécis, etc.).
+// Combine des signaux (numéro, set, variante, image, prix, région) pour trouver
+// LE bon idProduct parmi plusieurs cartes de même nom. Aucun critère ne décide
+// seul : c'est le score total qui tranche, ce qui rend le système robuste aux
+// erreurs individuelles (IA qui lit mal, hash d'image imprécis, etc.).
 //
 // Ce module est PUR (pas d'appels réseau) : on lui passe les candidats déjà
 // enrichis, il calcule les scores. Testable isolément (bloc en bas).
 
 // ---- Poids des critères (ajustables) ----
 const POIDS = {
-    numero: 50,   // fort : "184" == "184"
-    set: 40,      // fort : bon set (Destined Rivals)
-    image: 25,    // moyen : ressemblance visuelle (max si distance=0)
-    prix: 25,     // moyen : prix cohérent avec la rareté lue
-    region: 45    // fort : la région (occidental/japonais) doit correspondre
+    numero: 50,    // fort : "184" == "184"
+    set: 40,       // fort : bon set (Destined Rivals)
+    variante: 35,  // fort : départage normale vs reverse À NUMÉRO ÉGAL
+    image: 25,     // moyen : ressemblance visuelle (max si distance=0)
+    prix: 25,      // moyen : prix cohérent avec la rareté lue
+    region: 45     // fort : la région (occidental/japonais) doit correspondre
 };
 
 const DISTANCE_IMAGE_MAX = 64; // hash 8x8 = 64 bits
 
 /**
  * Note un candidat.
- * @param {object} candidat  { idProduct, idExpansion, numeroCardmarket, prix, distanceImage }
- * @param {object} lu        ce que l'IA/TCGdex ont lu : { numero, total, idExpansionAttendu, rareteElevee }
+ * @param {object} candidat  { idProduct, idExpansion, numeroCardmarket, variante, prix, distanceImage }
+ * @param {object} lu        ce que l'IA/TCGdex ont lu : { numero, total, idExpansionAttendu, rareteElevee, varianteAttendue }
  * @returns {{score:number, detail:object}}
  */
 function scorerCandidat(candidat, lu) {
@@ -57,13 +58,32 @@ function scorerCandidat(candidat, lu) {
         else { detail.set = `0 (exp ${candidat.idExpansion} hors du set attendu)`; }
     } else detail.set = '0 (set non déterminé)';
 
-    // 3. IMAGE : plus la distance de hash est faible, plus le bonus est élevé
+    // 3. VARIANTE (reverse vs normale) : DÉPARTAGE À NUMÉRO ÉGAL.
+    //    Sur un set, une même carte a souvent 2-3 idProducts au MÊME numéro
+    //    (normale=V1, reverse=V2, illustration=V3). Le critère numéro leur donne
+    //    à tous +50 -> égalité. Ce critère les sépare, MAIS seulement quand deux
+    //    conditions sont réunies :
+    //      - l'IA a tranché (lu.varianteAttendue est défini, ex. 'V2' si reverse lue)
+    //      - la variante du candidat est CONNUE en base (sets appris avec --maj)
+    //    Sans l'une des deux (set "allégé", ou IA incertaine), il reste neutre :
+    //    on ne pénalise jamais sur une donnée absente.
+    if (lu.varianteAttendue && candidat.variante) {
+        if (candidat.variante === lu.varianteAttendue) {
+            score += POIDS.variante;
+            detail.variante = `+${POIDS.variante} (${candidat.variante} = attendu)`;
+        } else {
+            score -= POIDS.variante;
+            detail.variante = `-${POIDS.variante} (${candidat.variante} ≠ attendu ${lu.varianteAttendue})`;
+        }
+    } else detail.variante = '0 (variante indéterminée)';
+
+    // 4. IMAGE : plus la distance de hash est faible, plus le bonus est élevé
     if (typeof candidat.distanceImage === 'number') {
         const bonus = Math.round(POIDS.image * (1 - candidat.distanceImage / DISTANCE_IMAGE_MAX));
         score += bonus; detail.image = `+${bonus} (distance ${candidat.distanceImage}/64)`;
     } else detail.image = '0 (pas d\'image)';
 
-    // 4. PRIX cohérent avec la rareté lue :
+    // 5. PRIX cohérent avec la rareté lue :
     //    - si carte "secrète"/IR (numéro > total) attendue -> on favorise un prix ÉLEVÉ
     //    - sinon (carte normale) -> on favorise un prix BAS
     if (typeof candidat.prix === 'number') {
@@ -73,7 +93,7 @@ function scorerCandidat(candidat, lu) {
         else detail.prix = `0 (prix ${candidat.prix}€ incohérent avec rareté lue)`;
     } else detail.prix = '0 (pas de prix)';
 
-    // 5. RÉGION : occidental (FR/EN...) vs japonais. Gros malus si ça se contredit
+    // 6. RÉGION : occidental (FR/EN...) vs japonais. Gros malus si ça se contredit
     //    (évite de choisir l'édition japonaise pour une carte française).
     if (lu.regionAttendue && candidat.region) {
         if (candidat.region === lu.regionAttendue) { score += POIDS.region; detail.region = `+${POIDS.region} (${candidat.region})`; }
@@ -101,31 +121,58 @@ function choisirMeilleur(candidats, lu) {
 
 module.exports = { scorerCandidat, choisirMeilleur, POIDS };
 
-// ---- Test isolé ----
+// ---- Tests isolés ----
 if (require.main === module) {
-    console.log("=== TEST scoring sur le cas Cynthia's Roserade ===\n");
-
-    // Ce que l'IA + TCGdex ont lu : carte 184/182 Destined Rivals -> IR (184 > 182)
-    const lu = {
-        numero: 184,
-        total: 182,
-        idExpansionAttendu: 6096, // Destined Rivals
-        rareteElevee: 184 > 182   // true -> on attend un prix élevé
+    let echecs = 0;
+    const verifier = (nom, obtenu, attendu) => {
+        const ok = obtenu === attendu;
+        console.log(`${ok ? '✅' : '❌'} ${nom} : ${obtenu}${ok ? '' : ` (attendu ${attendu})`}`);
+        if (!ok) echecs++;
     };
 
-    // Candidats (extraits réels de nos données)
-    const candidats = [
-        { idProduct: 826058, idExpansion: 6096, numeroCardmarket: 184, prix: 12.79, distanceImage: 23 }, // la vraie IR
-        { idProduct: 825882, idExpansion: 6096, numeroCardmarket: 8,   prix: 0.10,  distanceImage: 30 }, // commune DRI
-        { idProduct: 861964, idExpansion: 6413, numeroCardmarket: 139, prix: 30.00, distanceImage: 21 }, // IR d'un autre set
-        { idProduct: 816658, idExpansion: 6037, numeroCardmarket: 5,   prix: 0.09,  distanceImage: 31 }, // jap commune
-    ];
-
-    const { gagnant, scores, confiant } = choisirMeilleur(candidats, lu);
-    for (const s of scores) {
-        console.log(`idProduct ${s.candidat.idProduct} : SCORE ${s.score}`);
-        console.log(`   ${JSON.stringify(s.detail)}`);
+    // --- Test 1 : Cynthia's Roserade IR (184/182 Destined Rivals) ---
+    console.log('=== Test 1 : secret rare (numéro > total) ===');
+    {
+        const lu = { numero: 184, total: 182, idExpansionAttendu: 6096, rareteElevee: true, regionAttendue: 'occidental' };
+        const candidats = [
+            { idProduct: 826058, idExpansion: 6096, numeroCardmarket: 184, prix: 12.79, region: 'occidental' }, // la vraie IR
+            { idProduct: 825882, idExpansion: 6096, numeroCardmarket: 8,   prix: 0.10,  region: 'occidental' },
+            { idProduct: 861964, idExpansion: 6413, numeroCardmarket: 139, prix: 30.00, region: 'occidental' },
+            { idProduct: 816658, idExpansion: 6037, numeroCardmarket: 5,   prix: 0.09,  region: 'japonais' },
+        ];
+        const { gagnant } = choisirMeilleur(candidats, lu);
+        verifier('gagnant', gagnant.candidat.idProduct, 826058);
     }
-    console.log(`\n🏆 Gagnant : idProduct ${gagnant.candidat.idProduct} (score ${gagnant.score}) — confiance ${confiant ? 'HAUTE' : 'BASSE'}`);
-    console.log(`   Attendu : 826058 (la vraie IR 184/182 à 12,79€)`);
+
+    // --- Test 2 : REVERSE à numéro égal (le cas Mentali OBF) ---
+    // Trois produits au même n°086 : normale (V1), reverse (V2), spéciale (V3).
+    // L'IA a lu une REVERSE -> varianteAttendue 'V2'. Sans ce critère, égalité à +50.
+    console.log('\n=== Test 2 : reverse départagée à numéro égal ===');
+    {
+        const lu = { numero: 86, idExpansionsAttendues: [5385], rareteElevee: false, regionAttendue: 'occidental', varianteAttendue: 'V2' };
+        const candidats = [
+            { idProduct: 725166, idExpansion: 5385, numeroCardmarket: 86, variante: 'V1', prix: 0.50, region: 'occidental' }, // normale
+            { idProduct: 727069, idExpansion: 5385, numeroCardmarket: 86, variante: 'V2', prix: 1.20, region: 'occidental' }, // reverse (attendue)
+            { idProduct: 804328, idExpansion: 5385, numeroCardmarket: 86, variante: 'V3', prix: 4.00, region: 'occidental' }, // spéciale
+        ];
+        const { gagnant, confiant } = choisirMeilleur(candidats, lu);
+        verifier('gagnant = reverse', gagnant.candidat.idProduct, 727069);
+        verifier('confiance haute', confiant, true);
+    }
+
+    // --- Test 3 : set "allégé" (aucune variante connue) -> critère neutre, pas de régression ---
+    console.log('\n=== Test 3 : variante inconnue -> neutre ===');
+    {
+        const lu = { numero: 86, idExpansionsAttendues: [5385], rareteElevee: false, regionAttendue: 'occidental', varianteAttendue: 'V2' };
+        const candidats = [
+            { idProduct: 725166, idExpansion: 5385, numeroCardmarket: 86, variante: null, prix: 0.50, region: 'occidental' },
+            { idProduct: 727069, idExpansion: 5385, numeroCardmarket: 86, variante: null, prix: 1.20, region: 'occidental' },
+        ];
+        const { scores } = choisirMeilleur(candidats, lu);
+        // Sans variante en base, les deux gardent le même score (numéro+set+région) : aucun malus injuste
+        verifier('scores égaux (pas de malus sur donnée absente)', scores[0].score, scores[1].score);
+    }
+
+    console.log(`\n${echecs === 0 ? '🎉 Tous les tests passent.' : `⚠️ ${echecs} test(s) en échec.`}`);
+    process.exit(echecs === 0 ? 0 : 1);
 }
