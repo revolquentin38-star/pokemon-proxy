@@ -77,7 +77,7 @@ const SEUIL_PRIX_CORRECT  = 1.10; // jusqu'à 10% plus cher -> prix correct
 // Alternative moins chère à tester : "qwen/qwen3-vl-235b-a22b-instruct".
 // ⚠️ Vérifie l'ID exact sur https://openrouter.ai/models : un ID inconnu
 // renvoie une erreur "model not found" (sans casse : on ajuste et on relance).
-const MODELE_IA = "google/gemini-3-flash-preview";
+const MODELE_IA = "google/gemini-3.5-flash";
 
 // Interrupteur du scraping live Cardmarket. Mets à false pour tester sans aucune
 // requête vers Cardmarket (utile en cas de ban IP, ou pour un fonctionnement
