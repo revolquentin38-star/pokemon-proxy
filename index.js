@@ -700,12 +700,17 @@ function regionDuCodeSet(codeSet) {
 }
 
 // Région attendue déduite de ce que l'IA a lu :
-//  - langue JP -> japonais
+//  - langue JP -> japonais (= bucket ASIATIQUE)
+//  - chinois (ZH) / coréen (KR) -> asiatique aussi. Cardmarket range le chinois
+//    simplifié ET traditionnel + le coréen du côté japonais (même numérotation) ;
+//    leurs produits (codes type "mC", "...C") sont classés "japonais" ici. Sans ça,
+//    une carte chinoise prenait -45 de malus région et la bonne carte perdait.
 //  - langue occidentale (FR/EN/DE/ES/IT/PT) -> occidental
 //  - à défaut, la structure du numéro : "184/182" (occidental) vs pas de total (souvent JP)
 function regionAttendue(cardInfo) {
     const langue = (cardInfo.language || '').toUpperCase();
     if (langue === 'JP') return 'japonais';
+    if (['ZH', 'KR', 'ZH-CN', 'ZH-TW', 'CN', 'TW'].includes(langue)) return 'japonais';
     if (['FR', 'EN', 'DE', 'ES', 'IT', 'PT'].includes(langue)) return 'occidental';
     // Repli sur la structure du numéro : un total présent (X/Y) = format occidental
     if (cardInfo.total) return 'occidental';
