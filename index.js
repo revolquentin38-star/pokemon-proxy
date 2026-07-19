@@ -692,10 +692,15 @@ async function trouverIdProductParAttaques(nomExact, attaquesTCGdex) {
 // (sv9a, sv10s, m2a...). Règle empirique fiable sur nos données.
 function regionDuCodeSet(codeSet) {
     if (!codeSet) return null;
+    // Le préfixe "x" = les "Additionals" (reverse holos, cartes bonus) et NE change
+    // PAS la région : xPRE = Additionals de PRE (occidental), xsv8a = Additionals de
+    // sv8a (japonais). On le retire avant de classer, sinon le "x" minuscule fait
+    // passer une expansion occidentale (xPRE) pour du japonais et on l'écarte à tort.
+    const code = codeSet.replace(/^x/, '');
     // Un code purement en majuscules (lettres) = occidental
-    if (/^[A-Z0-9]+$/.test(codeSet) && /[A-Z]/.test(codeSet)) return 'occidental';
+    if (/^[A-Z0-9]+$/.test(code) && /[A-Z]/.test(code)) return 'occidental';
     // Contient une minuscule = japonais (sv9a, m2a, mC, xm2a...)
-    if (/[a-z]/.test(codeSet)) return 'japonais';
+    if (/[a-z]/.test(code)) return 'japonais';
     return null;
 }
 
