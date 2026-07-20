@@ -261,6 +261,7 @@ defautsVus : décris ce que tu OBSERVES réellement (ex: "blanchiment bord gauch
 IMPORTANT pour "number" et "total" : le numéro de collection est imprimé en bas de la carte sous la forme "X/Y" (ex: "184/182", "025/165"). Lis les DEUX nombres avec attention, ils sont petits mais cruciaux. "number" = le X (avant le slash), "total" = le Y (après le slash). Si le X est SUPÉRIEUR au Y (ex: 184/182), c'est une carte secrète/spéciale (souvent une Illustration Rare) — lis bien, ne confonds pas 184 avec 8.
 
 Le "setCode" est le petit code alphabétique (2 à 4 lettres) imprimé en bas de la carte à côté du numéro, ou parfois dans le titre de l'annonce (ex: "BLK 129"). Si tu ne le vois pas clairement, réponds null, n'invente rien.
+IMPORTANT — les TAMPONS/STAMPS de réimpression : si la carte porte un tampon anniversaire ou de sous-set (le logo doré "Celebrations 25 ans", le tampon "Pokémon 151", "Trainer Gallery", "Prize Pack"...), ce sont des réimpressions qui GARDENT le numéro d'origine (ex: Florizarre 15/102 en Celebrations). Dans ce cas, indique le set du TAMPON dans "setCode" (ex: "CEL" pour Celebrations, "MEW" pour 151, "TG" pour Trainer Gallery), PAS le set d'origine — c'est ce qui permet de distinguer la réimpression de la carte vintage au même numéro.
 
 Pour "rarete" : regarde le symbole de rareté et le style de la carte. "IR" = Illustration Rare (illustration pleine, personnage humain souvent), "SIR"/"SR" = Special/Super Rare, "AR" = Art Rare, "promo" = carte promotionnelle, "normale" = carte de jeu standard. Si tu n'es pas sûr, réponds "normale".
 ⚠️ NE CONFONDS PAS "rarete" et "etatEstime" : la rareté est une propriété d'IMPRESSION de la carte (IR, SR, promo, normale...), l'état est son USURE physique (NM, EX, GD...). N'écris JAMAIS un code d'état (EX, GD, NM...) dans le champ "rarete".
@@ -818,6 +819,9 @@ async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted, idExpans
             // sets appris AVEC les nouveaux champs (--maj). Absente = null -> neutre.
             variante: infoNum ? (infoNum.variante || null) : null,
             prix: await getPrixGuideLocal(p.idProduct),
+            // code de set appris (ex: "PAL", "EXP", "PGO") : sert à confronter ce que
+            // l'IA a lu (setCode/stamp) au set réel du candidat.
+            codeSet: codeSet || (infoNum && infoNum.codeSet) || null,
             // distanceImage volontairement absente : le hash perceptif a été retiré
             // (bruit sur photos d'annonce). Le critère image du scoring reste dans
             // scoring.js et se réactivera tout seul si on lui refournit un jour une
@@ -832,6 +836,7 @@ async function scorerCandidatsLocal(produits, cardInfo, imageUrlVinted, idExpans
 
     const lu = {
         numero: cardInfo.number || null,   // le numéro lu par l'IA (ex: 79, TG06)
+        setCode: cardInfo.setCode || null, // le code/stamp lu par l'IA (ex: PAL, CEL)
         idExpansionsAttendues,             // déduites du set TCGdex via le pré-remplissage
         rareteElevee: cardInfo.rareteElevee,
         regionAttendue: regionCible,
