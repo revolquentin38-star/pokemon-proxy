@@ -54,36 +54,22 @@ function scorerCandidat(candidat, lu) {
     } else detail.numero = '0 (numéro manquant)';
 
     // 2. SET : le candidat est-il dans l'expansion attendue ?
-    //    On accepte une LISTE : un set TCGdex peut correspondre à plusieurs
-    //    expansions Cardmarket (édition internationale, japonaise, suppléments).
-    //    Le setCode/stamp lu par l'IA affine ce critère : il confronte le code de
-    //    set RÉEL du candidat à ce que l'IA a lu sur la carte. Cas typique : une
-    //    réimpression (Celebrations, Trainer Gallery...) reprend un ancien numéro,
-    //    TCGdex matche le set d'origine par le numéro -> sans le stamp, on choisit
-    //    la mauvaise édition (au mauvais prix).
+    //    Le setCode/stamp lu par l'IA PRIME : une réimpression (Celebrations, Trainer
+    //    Gallery, 151...) reprend un ancien numéro, TCGdex matche alors le set d'origine
+    //    par le numéro. Le stamp tranche : un candidat dont le code RÉEL contredit le
+    //    stamp est une édition démontrablement fausse -> malus ; un candidat dont le
+    //    code == le stamp est la bonne édition -> bonus, même si TCGdex ne le relie pas.
     const attendues = lu.idExpansionsAttendues || (lu.idExpansionAttendu != null ? [lu.idExpansionAttendu] : []);
     const normCode = c => c ? String(c).toUpperCase().replace(/[^A-Z0-9]/g, '') : null;
     const codeIA = normCode(lu.setCode);
     const codeCand = normCode(candidat.codeSet);
-    const codeMatch = codeIA && codeCand && codeIA === codeCand;       // stamp confirme ce candidat
-    const codeContredit = codeIA && codeCand && codeIA !== codeCand;   // stamp contredit ce candidat
-    if (attendues.length && candidat.idExpansion != null) {
-        if (attendues.includes(candidat.idExpansion) && !codeContredit) {
-            score += POIDS.set; detail.set = `+${POIDS.set} (bon set)`;
-        } else if (attendues.includes(candidat.idExpansion) && codeContredit) {
-            // Dans le set déduit par TCGdex, MAIS le code réel contredit le stamp lu
-            // -> le set déduit est suspect ici : pas de bonus (sinon on fait gagner
-            // la mauvaise édition qui partage juste le numéro).
-            detail.set = `0 (dans le set TCGdex mais code ${candidat.codeSet} ≠ stamp lu ${lu.setCode})`;
-        } else if (codeMatch) {
-            // Hors du set TCGdex, MAIS son code réel == le stamp lu : c'est
-            // probablement LUI le bon (réimpression que TCGdex ne relie pas).
-            score += POIDS.set; detail.set = `+${POIDS.set} (code ${candidat.codeSet} = stamp lu)`;
-        } else {
-            detail.set = `0 (exp ${candidat.idExpansion} hors du set attendu)`;
-        }
-    } else if (codeMatch) {
+    if (codeIA && codeCand && codeIA === codeCand) {
         score += POIDS.set; detail.set = `+${POIDS.set} (code ${candidat.codeSet} = stamp lu)`;
+    } else if (codeIA && codeCand && codeIA !== codeCand) {
+        score -= POIDS.set; detail.set = `-${POIDS.set} (code ${candidat.codeSet} ≠ stamp lu ${lu.setCode})`;
+    } else if (attendues.length && candidat.idExpansion != null) {
+        if (attendues.includes(candidat.idExpansion)) { score += POIDS.set; detail.set = `+${POIDS.set} (bon set)`; }
+        else { detail.set = `0 (exp ${candidat.idExpansion} hors du set attendu)`; }
     } else detail.set = '0 (set non déterminé)';
 
     // 3. VARIANTE (reverse vs normale) : DÉPARTAGE À NUMÉRO ÉGAL.
@@ -202,31 +188,32 @@ if (require.main === module) {
     }
 
     // --- Test 4 : STAMP départage une réimpression (le cas Venusaur Celebrations) ---
-    // Venusaur 15/102 existe en Base Set ET en Celebrations (même numéro). TCGdex
-    // matche le Base Set par le numéro -> expansion attendue = celle du Base Set.
-    // L'IA a lu le stamp "CEL". Le candidat Base Set (code "EXP") est dans le set
-    // attendu MAIS son code contredit "CEL" -> il ne doit PAS rafler le bonus de set.
+    // Venusaur 15/102 existe en Base Set/Expansion Pack ET en Celebrations (même n°).
+    // TCGdex matche l'ancien set par le numéro -> expansion attendue = l'ancien set.
+    // L'IA a lu le stamp "CEL". Le candidat à l'ancien code ("EXP") contredit "CEL"
+    // -> malus. La Celebrations (code encore INCONNU) doit passer devant SANS que son
+    // code soit appris (grâce au malus sur la contradiction).
     console.log('\n=== Test 4 : stamp (réimpression Celebrations) ===');
     {
         const lu = { numero: 15, setCode: 'CEL', idExpansionsAttendues: [4169], rareteElevee: false, regionAttendue: 'occidental' };
-        const baseSet = { idProduct: 557654, idExpansion: 4169, numeroCardmarket: 15, codeSet: 'EXP', prix: 60, region: 'occidental' };
-        const { scores } = choisirMeilleur([baseSet], lu);
-        const s = scores.find(x => x.candidat.idProduct === 557654);
-        // le détail du set doit indiquer 0 (code contredit le stamp), pas +40
-        verifier('Base Set (code≠stamp) ne prend PAS le bonus de set', /^0 /.test(s.detail.set), true);
+        const candidats = [
+            { idProduct: 557654, idExpansion: 4169, numeroCardmarket: 15, codeSet: 'EXP', prix: 60, region: 'occidental' }, // ancien set (contredit)
+            { idProduct: 576773, idExpansion: 4347, numeroCardmarket: '15A1', codeSet: null, prix: 18, region: 'occidental' }, // Celebrations, code pas encore appris
+        ];
+        const { gagnant } = choisirMeilleur(candidats, lu);
+        verifier('gagnant = Celebrations (malus sur le code qui contredit)', gagnant.candidat.idProduct, 576773);
     }
 
-    // --- Test 5 : stamp CONFIRME un candidat hors du set TCGdex ---
-    // La réimpression n'est pas dans le set TCGdex, mais son code appris == stamp lu.
-    console.log('\n=== Test 5 : stamp confirme la réimpression ===');
+    // --- Test 5 : stamp CONFIRME un candidat une fois son code appris ---
+    console.log('\n=== Test 5 : stamp confirme la réimpression (code appris) ===');
     {
         const lu = { numero: 15, setCode: 'CEL', idExpansionsAttendues: [4169], rareteElevee: false, regionAttendue: 'occidental' };
         const candidats = [
-            { idProduct: 557654, idExpansion: 4169, numeroCardmarket: 15, codeSet: 'EXP', prix: 60, region: 'occidental' }, // Base Set (contredit)
-            { idProduct: 576773, idExpansion: 4347, numeroCardmarket: '15A1', codeSet: 'CEL', prix: 18, region: 'occidental' }, // Celebrations (code confirme)
+            { idProduct: 557654, idExpansion: 4169, numeroCardmarket: 15, codeSet: 'EXP', prix: 60, region: 'occidental' },
+            { idProduct: 576773, idExpansion: 4347, numeroCardmarket: '15A1', codeSet: 'CEL', prix: 18, region: 'occidental' }, // code appris = CEL
         ];
         const { gagnant } = choisirMeilleur(candidats, lu);
-        verifier('gagnant = Celebrations (stamp confirme)', gagnant.candidat.idProduct, 576773);
+        verifier('gagnant = Celebrations (code confirme)', gagnant.candidat.idProduct, 576773);
     }
 
     console.log(`\n${echecs === 0 ? '🎉 Tous les tests passent.' : `⚠️ ${echecs} test(s) en échec.`}`);
