@@ -36,7 +36,11 @@ function scorerCandidat(candidat, lu) {
     //    fait foi (50 pts), un numéro déduit de TCGdex (départagé par prix, ou set
     //    partagé JP/international) peut être faux -> il oriente sans écraser (25 pts).
     if (lu.numero != null && candidat.numeroCardmarket != null) {
-        const norm = n => String(n).trim().toLowerCase().replace(/^0+/, '') || '0';
+        // On compare sur les CHIFFRES seuls : les promos et sous-sets portent un
+        // préfixe de set (SWSH261, SM158, TG06, GG70...) que le catalogue stocke
+        // sans préfixe ("261"). On retire donc tout ce qui n'est pas un chiffre,
+        // puis les zéros de tête, des deux côtés. (ex: "SWSH261" -> "261")
+        const norm = n => String(n).trim().toLowerCase().replace(/[^0-9]/g, '').replace(/^0+/, '') || '0';
         const nCand = norm(candidat.numeroCardmarket);
         const nLu = norm(lu.numero);
         const fiable = candidat.certitudeNumero !== 'heuristique';
