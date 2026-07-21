@@ -58,6 +58,46 @@ function verifierJeton(req, res, next) {
     return res.status(401).json({ success: false, error: "Non autorisé" });
 }
 
+// --- Quota quotidien de scans par personne ---
+// LIMITE_SCANS_JOUR : nombre de scans gratuits par utilisateur et par jour (défaut 10).
+// CODE_ILLIMITE : code maître secret (variable d'env sur Render). Une requête qui le
+// présente n'est PAS limitée — c'est ainsi que l'admin se débride, sans jamais mettre
+// le code dans l'extension distribuée. Chaque install envoie un userId anonyme.
+const LIMITE_SCANS_JOUR = parseInt(process.env.LIMITE_SCANS_JOUR || '10', 10);
+const CODE_ILLIMITE = process.env.CODE_ILLIMITE || null;
+
+async function verifierQuota(req, res, next) {
+    try {
+        // 1) Code maître -> illimité (l'admin)
+        if (CODE_ILLIMITE && req.body && req.body.codeIllimite === CODE_ILLIMITE) return next();
+        // 2) Base indisponible -> on ne bloque pas l'utilisateur pour une panne DB
+        if (mongoose.connection.readyState !== 1) return next();
+        // 3) Pas d'userId (vieille version d'extension) -> on laisse passer
+        const userId = req.body && req.body.userId ? String(req.body.userId).slice(0, 80) : null;
+        if (!userId) return next();
+
+        const jour = new Date().toISOString().slice(0, 10); // AAAA-MM-JJ (UTC)
+        // Incrément atomique puis vérification (on redescend si dépassement).
+        const doc = await Quota.findOneAndUpdate(
+            { userId, jour },
+            { $inc: { count: 1 } },
+            { upsert: true, new: true }
+        );
+        if (doc.count > LIMITE_SCANS_JOUR) {
+            await Quota.updateOne({ userId, jour }, { $inc: { count: -1 } });
+            return res.status(429).json({
+                success: false,
+                quotaAtteint: true,
+                error: `Limite de ${LIMITE_SCANS_JOUR} scans par jour atteinte. Réessaie demain 🐀`
+            });
+        }
+        next();
+    } catch (e) {
+        console.error("Erreur quota:", e.message);
+        next(); // en cas d'erreur, ne jamais bloquer le scan
+    }
+}
+
 // ============================================================
 // CONFIG — à ajuster facilement
 // ============================================================
@@ -148,6 +188,15 @@ const numeroCarteSchema = new mongoose.Schema({
     certitude: String    // 'exacte' ou 'heuristique'
 });
 const NumeroCarte = mongoose.model('NumeroCarte', numeroCarteSchema, 'numeros_cartes');
+
+// Compteur de scans par utilisateur et par jour (pour la limite quotidienne).
+const quotaSchema = new mongoose.Schema({
+    userId: { type: String, required: true },
+    jour:   { type: String, required: true },   // AAAA-MM-JJ
+    count:  { type: Number, default: 0 }
+});
+quotaSchema.index({ userId: 1, jour: 1 }, { unique: true });
+const Quota = mongoose.model('Quota', quotaSchema, 'quotas');
 
 // Récupère les numéros connus pour une liste d'idProduct -> Map(idProduct => {numero, numeroUrl})
 async function lireNumeros(idsProducts) {
@@ -952,7 +1001,7 @@ function etatVintedVersCardmarket(etatVinted) {
     return null;
 }
 
-app.post('/api/analyser', verifierJeton, async (req, res) => {
+app.post('/api/analyser', verifierJeton, verifierQuota, async (req, res) => {
     try {
         const { imageUrl, imageUrls, title, vintedPrice, vintedEtat, debug } = req.body;
 
@@ -1194,7 +1243,7 @@ app.post('/api/analyser', verifierJeton, async (req, res) => {
 // renvoie les candidats CLASSÉS, mais ne touche PAS à Cardmarket : c'est
 // l'extension qui fera le live depuis le navigateur de l'utilisateur, avec son
 // IP et ses cookies. C'est la répartition qui évite les bannissements.
-app.post('/api/identifier', verifierJeton, async (req, res) => {
+app.post('/api/identifier', verifierJeton, verifierQuota, async (req, res) => {
     try {
         const { imageUrl, imageUrls, title, vintedEtat } = req.body;
         const photos = (Array.isArray(imageUrls) && imageUrls.length) ? imageUrls : [imageUrl];
