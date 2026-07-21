@@ -16,7 +16,8 @@ const POIDS = {
     variante: 35,  // fort : départage normale vs reverse À NUMÉRO ÉGAL
     image: 25,     // moyen : ressemblance visuelle (max si distance=0)
     prix: 25,      // moyen : prix cohérent avec la rareté lue
-    region: 45     // fort : la région (occidental/japonais) doit correspondre
+    region: 45,    // fort : la région (occidental/japonais) doit correspondre
+    secret: 30     // départage secret rare (n° > total) vs numéro normal — robuste aux erreurs d'OCR sur le n°
 };
 
 const DISTANCE_IMAGE_MAX = 64; // hash 8x8 = 64 bits
@@ -113,6 +114,22 @@ function scorerCandidat(candidat, lu) {
         if (candidat.region === lu.regionAttendue) { score += POIDS.region; detail.region = `+${POIDS.region} (${candidat.region})`; }
         else { score -= POIDS.region; detail.region = `-${POIDS.region} (candidat ${candidat.region} ≠ attendu ${lu.regionAttendue})`; }
     } else detail.region = '0 (région indéterminée)';
+
+    // 7. COHÉRENCE SECRET RARE : si le numéro lu dépasse le total (ex: 228/217), la
+    //    carte est un SECRET/alt-art -> son produit Cardmarket a lui aussi un numéro
+    //    AU-DESSUS du total. On favorise les candidats "secrets", on pénalise les
+    //    numéros normaux. Robuste aux erreurs d'OCR sur ces tout petits numéros :
+    //    288 lu "228" garde le bon candidat car 288 > 217 (secret), pas 142.
+    const luNum = lu.numero != null ? parseInt(String(lu.numero).match(/\d+/)?.[0] ?? '', 10) : NaN;
+    const totNum = lu.total != null ? parseInt(String(lu.total).match(/\d+/)?.[0] ?? '', 10) : NaN;
+    const luEstSecret = Number.isFinite(luNum) && Number.isFinite(totNum) && luNum > totNum;
+    if (luEstSecret && candidat.numeroCardmarket != null) {
+        const candNum = parseInt(String(candidat.numeroCardmarket).match(/\d+/)?.[0] ?? '', 10);
+        if (Number.isFinite(candNum)) {
+            if (candNum > totNum) { score += POIDS.secret; detail.secret = `+${POIDS.secret} (secret n°${candNum} > total ${totNum})`; }
+            else { score -= POIDS.secret; detail.secret = `-${POIDS.secret} (n°${candNum} normal, mais secret attendu)`; }
+        } else detail.secret = '0 (numéro candidat illisible)';
+    } else detail.secret = '0 (pas un secret rare)';
 
     return { score, detail };
 }
@@ -214,6 +231,20 @@ if (require.main === module) {
         ];
         const { gagnant } = choisirMeilleur(candidats, lu);
         verifier('gagnant = Celebrations (code confirme)', gagnant.candidat.idProduct, 576773);
+    }
+
+    // --- Test 6 : secret rare avec numéro MAL LU (le cas Favianos/Fezandipiti ex) ---
+    // Carte 288/217 (secret) mais l'IA lit "228". Les deux candidats ASC font 0 sur le
+    // numéro exact ; c'est la cohérence "secret" qui doit choisir le 288 (> total 217).
+    console.log('\n=== Test 6 : secret rare à numéro mal lu (288 lu 228) ===');
+    {
+        const lu = { numero: 228, total: 217, idExpansionsAttendues: [6395], rareteElevee: true, regionAttendue: 'occidental' };
+        const candidats = [
+            { idProduct: 869753, idExpansion: 6395, numeroCardmarket: 142, region: 'occidental' }, // normale (n° < total)
+            { idProduct: 869899, idExpansion: 6395, numeroCardmarket: 288, region: 'occidental' }, // le SIR (n° > total)
+        ];
+        const { gagnant } = choisirMeilleur(candidats, lu);
+        verifier('gagnant = le SIR n°288 (cohérence secret)', gagnant.candidat.idProduct, 869899);
     }
 
     console.log(`\n${echecs === 0 ? '🎉 Tous les tests passent.' : `⚠️ ${echecs} test(s) en échec.`}`);
