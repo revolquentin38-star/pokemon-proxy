@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
+const rateLimit = require('express-rate-limit');
 
 // Le module live (Puppeteer) n'est utilisé QUE par l'ancienne architecture, où le
 // serveur tournait sur ton PC. En déploiement (Render), Puppeteer n'est pas
@@ -21,6 +22,7 @@ try {
 const { choisirMeilleur } = require('./scoring');
 
 const app = express();
+app.set('trust proxy', 1); // Render est derrière un proxy → nécessaire pour lire la vraie IP côté rate-limit
 const PORT = process.env.PORT || 3000;
 
 // SÉCURITÉ : sans restriction, n'importe quel site ouvert dans ton navigateur
@@ -42,6 +44,18 @@ app.use(cors({
     }
 }));
 app.use(express.json());
+
+// Limite anti-abus par IP : backstop indépendant du quota par utilisateur (qui, lui,
+// se contourne en changeant d'identifiant). Ne s'applique QU'aux routes IA coûteuses —
+// surtout pas à /ping, sinon le keep-alive cron-job se ferait jeter.
+const limiteurIA = rateLimit({
+    windowMs: 60 * 60 * 1000,   // fenêtre : 1 heure
+    max: 60,                    // 60 requêtes/h/IP (large pour un usage normal, coupe le pilonnage)
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, error: 'Trop de requêtes, réessaie plus tard.' }
+});
+app.use(['/api/identifier', '/api/analyser'], limiteurIA);
 
 // Jeton partagé entre l'extension et le serveur. Empêche une page web d'utiliser
 // ton serveur même si elle contournait le CORS. À définir dans le .env :
