@@ -557,7 +557,7 @@ function genererVariantesNom(name) {
     return [...variantes];
 }
 
-async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted, langue = 'EN') {
+async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted, langue = 'EN', totalImprime = null) {
     try {
         const variantes = genererVariantesNom(name);
         let resultats = [];
@@ -623,11 +623,44 @@ async function trouverCarteTCGdex(name, number, setCode, imageUrlVinted, langue 
                 choisi = correspondance;
                 console.log(`ℹ️ Départage par le set "${setCode}".`);
             } else {
-                // Aucun moyen de trancher ici : on prend le premier mais on signale
-                // l'incertitude. Le garde-fou live vérifiera le numéro et rebondira
-                // si besoin — c'est lui qui garantit la justesse, pas ce choix.
-                ambigu = true;
-                console.log(`⚠️ ${resultats.length} impressions possibles pour "${name}" #${number} et pas de set pour trancher — le live vérifiera.`);
+                // Pas de code de set lisible (fréquent sur les vieilles cartes). On tente
+                // de trancher par le TOTAL imprimé (X/Y -> Y) : chaque set a un nombre de
+                // cartes officiel. On récupère le cardCount des sets candidats via TCGdex
+                // et on garde celui qui colle. Corrige "même numéro dans plusieurs sets"
+                // (ex: Venusaur 3/108 Dark Explorers vs Venusaur ex #3 du set 151).
+                const totN = totalImprime ? parseInt(String(totalImprime).replace(/\D/g, ''), 10) : null;
+                let departageTotal = null;
+                if (totN) {
+                    const countParSet = {};
+                    const matches = [];
+                    for (const r of resultats) {
+                        const setId = r.id.includes('-') ? r.id.slice(0, r.id.lastIndexOf('-')) : null;
+                        if (!setId) continue;
+                        if (countParSet[setId] === undefined) {
+                            try {
+                                const s = await axios.get(`https://api.tcgdex.net/v2/en/sets/${encodeURIComponent(setId)}`, { timeout: 12000 });
+                                countParSet[setId] = s.data?.cardCount?.official ?? s.data?.cardCount?.total ?? null;
+                            } catch (_) { countParSet[setId] = null; }
+                        }
+                        if (countParSet[setId] === totN) matches.push(r);
+                    }
+                    if (matches.length === 1) {
+                        departageTotal = matches[0];
+                    } else if (matches.length > 1) {
+                        choisi = matches[0];
+                        ambigu = true;
+                        console.log(`⚠️ ${matches.length} sets à ${totN} cartes pour "${name}" #${number} — le live tranchera.`);
+                    }
+                }
+                if (departageTotal) {
+                    choisi = departageTotal;
+                    console.log(`ℹ️ Départage par le total imprimé (${totN} cartes) -> ${choisi.id}.`);
+                } else if (!ambigu) {
+                    // Aucun moyen de trancher : premier candidat, marqué incertain. Le
+                    // garde-fou live vérifiera le numéro et rebondira si besoin.
+                    ambigu = true;
+                    console.log(`⚠️ ${resultats.length} impressions possibles pour "${name}" #${number} et pas de set pour trancher — le live vérifiera.`);
+                }
             }
         }
 
@@ -1047,7 +1080,7 @@ app.post('/api/analyser', verifierJeton, verifierQuota, async (req, res) => {
         //    e) repli TCGdex si rien d'autre n'a marché
         if (!resultat) {
             // 2a. Identification précise via TCGdex + image
-            const trouvailleTCGdex = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, imageUrl, cardInfo.language);
+            const trouvailleTCGdex = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, imageUrl, cardInfo.language, cardInfo.total);
             if (!trouvailleTCGdex) {
                 return res.json({ success: false, error: `Carte "${cardInfo.name}${cardInfo.setCode ? ' ' + cardInfo.setCode : ''} #${cardInfo.number}" non trouvée sur TCGdex` });
             }
@@ -1272,7 +1305,7 @@ app.post('/api/identifier', verifierJeton, verifierQuota, async (req, res) => {
         if (!cardInfo) return res.json({ success: false, error: "Analyse IA échouée" });
 
         // 2. Identification précise via TCGdex (+ variantes de nom, multilingue)
-        const trouvaille = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, photos[0], cardInfo.language);
+        const trouvaille = await trouverCarteTCGdex(cardInfo.name, cardInfo.number, cardInfo.setCode, photos[0], cardInfo.language, cardInfo.total);
         if (!trouvaille) {
             return res.json({ success: false, error: `Carte "${cardInfo.name}" #${cardInfo.number} non trouvée sur TCGdex`, cardInfo });
         }
