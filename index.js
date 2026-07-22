@@ -1440,7 +1440,80 @@ app.post('/api/apprendre', verifierJeton, async (req, res) => {
         res.json({ success: false, error: e.message });
     }
 });
+// Apprentissage par LOT : une page de galerie Cardmarket d'un coup, depuis le
+// userscript Tampermonkey. N'ÉCRASE JAMAIS une carte déjà connue (on filtre les
+// idProduct existants + $setOnInsert). idExpansion déduit du catalogue, comme
+// apprendreUnSet. Renvoie le décompte, qui sert de feedback à la barre.
+app.post('/api/apprendre-lot', verifierJeton, async (req, res) => {
+    try {
+        const { cartes } = req.body; // [{ idProduct, numero, numeroUrl, codeSet, nomFr, variante, slug, slugSet }, ...]
+        if (!Array.isArray(cartes) || cartes.length === 0) {
+            return res.json({ success: false, error: "Aucune carte reçue" });
+        }
 
+        const ids = [...new Set(cartes.map(c => Number(c.idProduct)).filter(Boolean))];
+        if (ids.length === 0) return res.json({ success: false, error: "Aucun idProduct valide" });
+
+        // idExpansion : toutes les cartes d'une page sont du même set. On le déduit
+        // du catalogue via n'importe quel idProduct (exactement comme apprendreUnSet).
+        let idExpansion = null;
+        if (mongoose.connection.readyState === 1) {
+            const ref = await CatalogueProduit.findOne({ idProduct: { $in: ids } }).lean();
+            idExpansion = ref?.idExpansion ?? null;
+        }
+
+        // Ce qui existe déjà -> on n'y touche pas
+        const dejaEnBase = new Set(
+            (await NumeroCarte.find({ idProduct: { $in: ids } }, { idProduct: 1 }).lean())
+                .map(d => d.idProduct)
+        );
+        const nouvelles = cartes.filter(c => c.idProduct && !dejaEnBase.has(Number(c.idProduct)));
+
+        if (nouvelles.length > 0) {
+            const ops = nouvelles.map(c => ({
+                updateOne: {
+                    filter: { idProduct: Number(c.idProduct) },
+                    // $setOnInsert : n'écrit QUE si le document est créé.
+                    // Une carte déjà présente reste strictement intacte (double sécurité
+                    // avec le filtre dejaEnBase, utile en cas de course entre 2 pages).
+                    update: {
+                        $setOnInsert: {
+                            idProduct:   Number(c.idProduct),
+                            idExpansion: idExpansion != null ? Number(idExpansion) : null,
+                            numero:      c.numero    != null ? String(c.numero)    : null,
+                            numeroUrl:   c.numeroUrl != null ? String(c.numeroUrl) : null,
+                            codeSet:     c.codeSet  || null,
+                            nomFr:       c.nomFr    || null,
+                            variante:    c.variante || null,
+                            slug:        c.slug     || null,
+                            slugSet:     c.slugSet  || null,
+                            source:      'cardmarket',
+                            certitude:   'exacte'
+                        }
+                    },
+                    upsert: true
+                }
+            }));
+            await NumeroCarte.bulkWrite(ops, { ordered: false });
+
+            // Mémorise le code set de la page au passage (gratuit)
+            const cs = nouvelles.find(c => c.codeSet)?.codeSet || null;
+            if (cs && idExpansion != null) await memoriserCodeSet(Number(idExpansion), cs);
+        }
+
+        console.log(`🧠 [apprendre-lot] ${nouvelles.length} nouvelles / ${cartes.length} reçues (exp ${idExpansion ?? '?'})`);
+        res.json({
+            success: true,
+            recus: cartes.length,
+            nouvelles: nouvelles.length,
+            dejaConnus: cartes.length - nouvelles.length,
+            idExpansion
+        });
+    } catch (e) {
+        console.error("❌ [apprendre-lot]", e.message);
+        res.json({ success: false, error: e.message });
+    }
+});
 // Route de réveil : l'extension l'appelle dès qu'une page Vinted se charge, pour
 // que le serveur (endormi sur le plan gratuit Render après 15 min d'inactivité)
 // soit déjà chaud quand l'utilisateur clique sur "Analyser". Volontairement
