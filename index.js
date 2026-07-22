@@ -1440,44 +1440,57 @@ app.post('/api/apprendre', verifierJeton, async (req, res) => {
         res.json({ success: false, error: e.message });
     }
 });
-// Apprentissage par LOT : une page de galerie Cardmarket d'un coup, depuis le
-// userscript Tampermonkey. N'ÉCRASE JAMAIS une carte déjà connue (on filtre les
-// idProduct existants + $setOnInsert). idExpansion déduit du catalogue, comme
-// apprendreUnSet. Renvoie le décompte, qui sert de feedback à la barre.
+// Apprentissage par LOT depuis le userscript. Règle de priorité :
+//  - déjà source:'cardmarket' (exact) -> INTACT, on ne le retouche pas
+//  - source:'tcgdex' (heuristique) ou sans source (vieux Puppeteer allégé)
+//    -> ÉCRASÉ par la lecture exacte Cardmarket (nomFr/variante/slug en bonus)
+//  - absent -> inséré
+// On ignore les cartes sans numéro lisible (elles n'aident pas le scoring).
 app.post('/api/apprendre-lot', verifierJeton, async (req, res) => {
     try {
-        const { cartes } = req.body; // [{ idProduct, numero, numeroUrl, codeSet, nomFr, variante, slug, slugSet }, ...]
+        const { cartes } = req.body;
         if (!Array.isArray(cartes) || cartes.length === 0) {
             return res.json({ success: false, error: "Aucune carte reçue" });
         }
 
-        const ids = [...new Set(cartes.map(c => Number(c.idProduct)).filter(Boolean))];
-        if (ids.length === 0) return res.json({ success: false, error: "Aucun idProduct valide" });
+        // Cartes exploitables = celles qui ont au moins un numéro (titre ou URL)
+        const lisibles = cartes.filter(c => c.idProduct && (c.numero || c.numeroUrl));
+        const sansNumero = cartes.length - lisibles.length;
 
-        // idExpansion : toutes les cartes d'une page sont du même set. On le déduit
-        // du catalogue via n'importe quel idProduct (exactement comme apprendreUnSet).
+        const ids = [...new Set(lisibles.map(c => Number(c.idProduct)).filter(Boolean))];
+        if (ids.length === 0) {
+            return res.json({ success: true, recus: cartes.length, nouvelles: 0, ameliorees: 0, dejaExactes: 0, sansNumero });
+        }
+
+        // idExpansion déduit du catalogue (comme apprendreUnSet)
         let idExpansion = null;
         if (mongoose.connection.readyState === 1) {
             const ref = await CatalogueProduit.findOne({ idProduct: { $in: ids } }).lean();
             idExpansion = ref?.idExpansion ?? null;
         }
 
-        // Ce qui existe déjà -> on n'y touche pas
-        const dejaEnBase = new Set(
-            (await NumeroCarte.find({ idProduct: { $in: ids } }, { idProduct: 1 }).lean())
-                .map(d => d.idProduct)
-        );
-        const nouvelles = cartes.filter(c => c.idProduct && !dejaEnBase.has(Number(c.idProduct)));
+        // Source actuelle de chaque idProduct déjà en base
+        const existants = await NumeroCarte.find({ idProduct: { $in: ids } }, { idProduct: 1, source: 1 }).lean();
+        const sourceParId = new Map(existants.map(d => [d.idProduct, d.source || null]));
 
-        if (nouvelles.length > 0) {
-            const ops = nouvelles.map(c => ({
+        // Classement : exact -> intact ; reste -> à écrire
+        const aEcrire = [];
+        let nouvelles = 0, ameliorees = 0, dejaExactes = 0;
+        for (const c of lisibles) {
+            const id = Number(c.idProduct);
+            if (!sourceParId.has(id))                        { aEcrire.push(c); nouvelles++; }
+            else if (sourceParId.get(id) !== 'cardmarket')   { aEcrire.push(c); ameliorees++; }
+            else                                             { dejaExactes++; } // déjà exact -> on n'y touche pas
+        }
+
+        if (aEcrire.length > 0) {
+            const ops = aEcrire.map(c => ({
                 updateOne: {
                     filter: { idProduct: Number(c.idProduct) },
-                    // $setOnInsert : n'écrit QUE si le document est créé.
-                    // Une carte déjà présente reste strictement intacte (double sécurité
-                    // avec le filtre dejaEnBase, utile en cas de course entre 2 pages).
+                    // $set (pas $setOnInsert) : on VEUT écraser une entrée heuristique
+                    // par la donnée exacte. Les entrées 'cardmarket' sont déjà exclues.
                     update: {
-                        $setOnInsert: {
+                        $set: {
                             idProduct:   Number(c.idProduct),
                             idExpansion: idExpansion != null ? Number(idExpansion) : null,
                             numero:      c.numero    != null ? String(c.numero)    : null,
@@ -1496,19 +1509,12 @@ app.post('/api/apprendre-lot', verifierJeton, async (req, res) => {
             }));
             await NumeroCarte.bulkWrite(ops, { ordered: false });
 
-            // Mémorise le code set de la page au passage (gratuit)
-            const cs = nouvelles.find(c => c.codeSet)?.codeSet || null;
+            const cs = aEcrire.find(c => c.codeSet)?.codeSet || null;
             if (cs && idExpansion != null) await memoriserCodeSet(Number(idExpansion), cs);
         }
 
-        console.log(`🧠 [apprendre-lot] ${nouvelles.length} nouvelles / ${cartes.length} reçues (exp ${idExpansion ?? '?'})`);
-        res.json({
-            success: true,
-            recus: cartes.length,
-            nouvelles: nouvelles.length,
-            dejaConnus: cartes.length - nouvelles.length,
-            idExpansion
-        });
+        console.log(`🧠 [apprendre-lot] ${nouvelles} nouv. / ${ameliorees} améliorées / ${dejaExactes} déjà exactes (exp ${idExpansion ?? '?'})`);
+        res.json({ success: true, recus: cartes.length, nouvelles, ameliorees, dejaExactes, sansNumero, idExpansion });
     } catch (e) {
         console.error("❌ [apprendre-lot]", e.message);
         res.json({ success: false, error: e.message });
